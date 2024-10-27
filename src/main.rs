@@ -1,30 +1,18 @@
+use ::glam::DVec2;
 use core::f64;
 use egui::*;
 use macroquad::prelude::*;
-use nalgebra::{distance, distance_squared, Point2, UnitVector2, Vector2};
+use std::cmp::Ordering;
 pub(crate) use std::{
     cell::RefCell,
     fmt::Display,
     rc::{Rc, Weak},
 };
-use std::{cmp::Ordering, ops::Mul};
 
 type Float = f64;
-type V2 = Vector2<Float>;
-type P2 = Point2<Float>;
-type U2 = UnitVector2<Float>;
+type V2 = DVec2;
+type P2 = DVec2;
 type NodeId = usize;
-
-pub trait Projectable {
-    fn project_on(&self, onto: &V2) -> V2;
-}
-
-impl Projectable for V2 {
-    fn project_on(&self, onto: &V2) -> V2 {
-        let onton = onto.normalize();
-        self.dot(&onton) * onton
-    }
-}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GridType {
@@ -120,7 +108,7 @@ impl Contraption {
     }
 
     pub fn acceleration(&self, node_ix: usize, kps: &[P2], kvs: &[V2]) -> V2 {
-        let mut acc = V2::zeros();
+        let mut acc = V2::ZERO;
         let node = &self.nodes[node_ix];
         for attached in node.attached.iter() {
             if let Some(spring) = attached.spring.upgrade() {
@@ -144,12 +132,12 @@ impl Contraption {
         }
         for vs in self.kvs.iter_mut() {
             while vs.len() < self.nodes.len() {
-                vs.push(V2::zeros());
+                vs.push(V2::ZERO);
             }
         }
         for accs in self.kaccs.iter_mut() {
             while accs.len() < self.nodes.len() {
-                accs.push(V2::zeros());
+                accs.push(V2::ZERO);
             }
         }
         // fill in initial values
@@ -196,7 +184,7 @@ impl Contraption {
         let ixa = self.get_node_ix(node_id_a);
         let ixb = self.get_node_ix(node_id_b);
         if let (Some(ixa), Some(ixb)) = (ixa, ixb) {
-            let node_distance = distance(&self.nodes[ixa].position, &self.nodes[ixb].position);
+            let node_distance = self.nodes[ixa].position.distance(self.nodes[ixb].position);
             self.create_spring(node_distance, spring_constant, dampening);
             let aa = Attached {
                 spring: Rc::downgrade(self.springs.last().unwrap()),
@@ -216,8 +204,8 @@ impl Contraption {
             id: self.next_node_id,
             radius,
             position,
-            velocity: V2::zeros(),
-            acceleration: V2::zeros(),
+            velocity: V2::ZERO,
+            acceleration: V2::ZERO,
             weight: radius * radius,
             stationary: false,
             attached: Vec::new(),
@@ -233,7 +221,7 @@ impl Contraption {
         spring_constant: Float,
         spring_dampening: Float,
     ) {
-        let node_distance = distance(&self.nodes[ixa].position, &self.nodes[ixb].position);
+        let node_distance = self.nodes[ixa].position.distance(self.nodes[ixb].position);
         self.create_spring(node_distance, spring_constant, spring_dampening);
         let aa = Attached {
             spring: Rc::downgrade(self.springs.last().unwrap()),
@@ -336,7 +324,7 @@ impl Contraption {
     pub fn nearest_node_ix(&self, pos: &P2) -> Option<(usize, Float)> {
         let mut res = None;
         for (ix, node) in self.nodes.iter().enumerate() {
-            let new_dist = distance_squared(pos, &node.position);
+            let new_dist = pos.distance_squared(node.position);
             if let Some((_, dist)) = res {
                 if new_dist < dist {
                     res = Some((ix, new_dist));
@@ -356,17 +344,17 @@ impl Contraption {
                 if let Some(ix) = self.get_node_ix(attached.other_node_id) {
                     let other_node = &self.nodes[ix];
                     let dirab = other_node.position - node.position;
-                    if dirab.norm() <= f64::EPSILON {
+                    if dirab.length() <= f64::EPSILON {
                         continue;
                     }
                     let dirba = -dirab;
                     // if to is closer to the spring than any of its nodes
                     let a = to - node.position;
                     let b = to - other_node.position;
-                    if (dirab.dot(&a) > 0.0) && (dirba.dot(&b) > 0.0) {
+                    if (dirab.dot(a) > 0.0) && (dirba.dot(b) > 0.0) {
                         // calculate the distance
                         let dirabn = dirab.normalize();
-                        let dist = (a.norm_squared() - dirabn.dot(&a).powi(2)).sqrt();
+                        let dist = (a.length_squared() - dirabn.dot(a).powi(2)).sqrt();
                         if let Some((_, current_dist)) = res {
                             if dist < current_dist {
                                 res = Some((attached.spring.clone(), dist));
@@ -404,7 +392,7 @@ impl Contraption {
         spring_constant: Float,
         damping_factor: Float,
     ) {
-        let resting_length = distance(&self.nodes[ixa].position, &self.nodes[ixb].position);
+        let resting_length = self.nodes[ixa].position.distance(self.nodes[ixb].position);
         let spring = Spring {
             spring_constant,
             resting_length,
@@ -454,12 +442,11 @@ impl Contraption {
     pub fn energy(&self) -> Float {
         let mut energy = 0.0;
         for node in &self.nodes {
-            energy += 0.5 * node.weight * node.velocity.norm().powi(2);
+            energy += 0.5 * node.weight * node.velocity.length_squared();
             for attached in &node.attached {
                 if let Some(spring) = attached.spring.upgrade() {
                     if let Some(other_node_ix) = self.get_node_ix(attached.other_node_id) {
-                        let distance =
-                            distance(&node.position, &self.nodes[other_node_ix].position);
+                        let distance = node.position.distance(self.nodes[other_node_ix].position);
                         energy += 0.25
                             * (spring.borrow().resting_length - distance).powi(2)
                             * spring.borrow().spring_constant;
@@ -494,11 +481,11 @@ pub struct Spring {
 
 impl Spring {
     fn force(&self, dir: &V2, vdiff: &V2) -> V2 {
-        if *dir == V2::zeros() {
-            V2::zeros()
+        if *dir == V2::ZERO {
+            V2::ZERO
         } else {
-            let diff = (1.0 - (self.resting_length / dir.norm())).mul(5.0).powi(9) * dir;
-            self.spring_constant * diff + self.damping_factor * vdiff.project_on(dir)
+            let diff = (1.0 - (self.resting_length / dir.length())) * dir;
+            self.spring_constant * diff + self.damping_factor * vdiff.project_onto(*dir)
         }
     }
 }
@@ -518,7 +505,7 @@ impl Attached {
     }
 
     pub fn length(&self, nodes: &[Node], main_node_position: P2) -> Float {
-        self.relative_position(nodes, main_node_position).norm()
+        self.relative_position(nodes, main_node_position).length()
     }
 
     pub fn is_destruct(&self, nodes: &[Node], main_node_position: P2) -> bool {
@@ -535,7 +522,7 @@ impl Attached {
             .binary_search_by_key(&self.other_node_id, |n| n.id)
             .expect("relative_position(...) => missing node");
         print!("Node@({})", nodes[node_ix]);
-        print!("Node@({})", main_node.position.xy());
+        print!("Node@({:?})", main_node.position.to_array());
         println!();
     }
 }
@@ -621,7 +608,7 @@ impl Node {
 impl Display for Node {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "velocity: {:.2}", self.velocity)?;
-        writeln!(f, "acc: {:.2}", self.acceleration.norm())?;
+        writeln!(f, "acc: {:.2}", self.acceleration.length())?;
         writeln!(f, "weight: {:.2}", self.weight)
     }
 }
@@ -701,8 +688,8 @@ impl SpringyApp {
                 if let Some(ix) = self.contraption.get_node_ix(id) {
                     let node = &mut self.contraption.nodes[ix];
                     if ui.checkbox(&mut node.stationary, "stationary").changed() {
-                        node.velocity = V2::zeros();
-                        node.acceleration = V2::zeros();
+                        node.velocity = V2::ZERO;
+                        node.acceleration = V2::ZERO;
                     }
                     ui.label(format!("{node}"));
                     ui.horizontal(|ui| {
@@ -980,7 +967,7 @@ fn pull_to_mouse(contraption: &mut Contraption, force: Float) {
             continue;
         }
         let dir = mpos - node.position;
-        let dist = dir.norm();
+        let dist = dir.length();
         let dir = dir.normalize();
         if dist > 0. {
             node.velocity += dir * (force * 10. / (dist + 10.));
@@ -1026,11 +1013,11 @@ fn draw_vector(start_point: &P2, v: &V2, color: Color) {
         color,
     );
     let s = v[1].signum();
-    let angle = v.angle(&V2::new(s, 0.0));
-    let mut angle = 180.0 * angle / std::f64::consts::PI;
-    if s < 0.0 {
-        angle += 60.0;
+    let mut angle = v.angle_to(V2::new(s, 0.0)).abs();
+    if v.y < 0.0 {
+        angle += std::f64::consts::PI;
     }
+    let angle = 180.0 * angle / std::f64::consts::PI;
     draw_poly(
         end_point[0] as f32,
         end_point[1] as f32,
