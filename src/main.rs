@@ -379,8 +379,8 @@ impl Contraption {
             spring_constant,
             resting_length,
             damping_factor,
-            min_len: 0.25 * resting_length,
-            max_len: 4.0 * resting_length,
+            min_len: 0.5 * resting_length,
+            max_len: 2.0 * resting_length,
         };
         self.springs.push(Rc::new(RefCell::new(spring)));
     }
@@ -431,7 +431,9 @@ impl Contraption {
     }
 
     pub fn delete_node(&mut self, node_id: NodeId) {
-        todo!()
+        if let Some(ix) = self.get_node_ix(node_id) {
+            self.nodes.remove(ix);
+        }
     }
 
     pub fn clear(&mut self) {
@@ -987,18 +989,37 @@ fn draw_contraption(contraption: &Contraption) {
         for attached in &node.attached {
             if let Some(other_ix) = contraption.get_node_ix(attached.other_node_id) {
                 let pos_b = contraption.nodes[other_ix].position;
-                draw_line(
-                    pos_a[0] as f32,
-                    pos_a[1] as f32,
-                    pos_b[0] as f32,
-                    pos_b[1] as f32,
-                    2.,
-                    WHITE,
-                );
+                if let Some(spring) = attached.spring.upgrade() {
+                    let dist = pos_a.distance(pos_b);
+                    let resting_length = spring.borrow().resting_length;
+                    let max_len = spring.borrow().max_len;
+                    let stretch_factor = if dist < resting_length {
+                        (resting_length - dist) / resting_length
+                    } else {
+                        (dist - resting_length) / (max_len - resting_length)
+                    };
+                    let color = colorous::RED_YELLOW_GREEN.eval_continuous(1.0 - stretch_factor);
+                    draw_line(
+                        pos_a[0] as f32,
+                        pos_a[1] as f32,
+                        pos_b[0] as f32,
+                        pos_b[1] as f32,
+                        2.,
+                        macroquad::color::Color::from_rgba(color.r, color.g, color.b, 255),
+                    );
+                }
             }
         }
-        draw_vector(&node.position, &node.velocity, YELLOW);
-        draw_vector(&node.position, &(node.acceleration * 0.1), RED);
+        let mut velocity_color = BEIGE;
+        velocity_color.a = 0.5;
+        draw_vector(&node.position, &(node.velocity * 0.1), velocity_color);
+        let mut acceleration_color = VIOLET;
+        acceleration_color.a = 0.5;
+        draw_vector(
+            &node.position,
+            &(node.acceleration * 0.01),
+            acceleration_color,
+        );
     }
 }
 
