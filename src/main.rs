@@ -379,8 +379,8 @@ impl Contraption {
             spring_constant,
             resting_length,
             damping_factor,
-            min_len: 0.5 * resting_length,
-            max_len: 2.0 * resting_length,
+            min_len: 0.2 * resting_length,
+            max_len: 5.0 * resting_length,
         };
         self.springs.push(Rc::new(RefCell::new(spring)));
     }
@@ -433,6 +433,20 @@ impl Contraption {
     pub fn delete_node(&mut self, node_id: NodeId) {
         if let Some(ix) = self.get_node_ix(node_id) {
             self.nodes.remove(ix);
+        }
+    }
+
+    pub fn delete_spring(&mut self, spring_rc: Weak<RefCell<Spring>>) {
+        let mut remove_ix = None;
+        for (ix, spring) in self.springs.iter().enumerate() {
+            let downgraded = Rc::downgrade(spring);
+            if Weak::ptr_eq(&downgraded, &spring_rc) {
+                remove_ix = Some(ix);
+                break;
+            }
+        }
+        if let Some(ix) = remove_ix {
+            self.springs.remove(ix);
         }
     }
 
@@ -855,6 +869,9 @@ async fn main() {
                 if ui.button("Draw Joints").clicked() {
                     app.app_mode = AppMode::SpringStart;
                 }
+                if ui.button("Cut Spring").clicked() {
+                    app.app_mode = AppMode::CutSpring;
+                }
                 if ui.button("Clear").clicked() {
                     app.contraption.clear();
                 }
@@ -897,6 +914,7 @@ async fn main() {
                         }
                     }
                 }
+                AppMode::CutSpring => {}
             }
         }
 
@@ -939,6 +957,17 @@ async fn main() {
         if is_mouse_button_down(MouseButton::Right) && !mouse_hover {
             pull_to_mouse(&mut app.contraption, 50.);
         }
+        if is_mouse_button_down(MouseButton::Left) && (app.app_mode == AppMode::CutSpring) {
+            let mpos = mouse_position();
+            if let Some((spring_ref, dist)) = app
+                .contraption
+                .nearest_spring(&P2::new(mpos.0 as Float, mpos.1 as Float))
+            {
+                if dist < 2.0 {
+                    app.contraption.delete_spring(spring_ref);
+                }
+            }
+        }
 
         draw_contraption(&app.contraption);
 
@@ -957,6 +986,7 @@ fn disp_app_mode(ui: &mut Ui, mode: &AppMode) {
             AppMode::NodeSelected { node_id: _ } => ui.label("NodeSelected"),
             AppMode::SpringStart => ui.label("JointStart"),
             AppMode::SpringEnd { node_a_id: _ } => ui.label("JointEnd"),
+            AppMode::CutSpring => ui.label("CutSpring"),
         }
     });
 }
@@ -1049,13 +1079,14 @@ fn draw_vector(start_point: &P2, v: &V2, color: Color) {
     );
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum AppMode {
     NodeSelected { node_id: Option<NodeId> },
     SpringSelected { spring: Weak<RefCell<Spring>> },
     PlaceNode,
     SpringStart,
     SpringEnd { node_a_id: NodeId },
+    CutSpring,
 }
 
 impl PartialEq for AppMode {
@@ -1076,6 +1107,7 @@ impl PartialEq for AppMode {
             (AppMode::SpringSelected { spring: sa }, AppMode::SpringSelected { spring: sb }) => {
                 sa.ptr_eq(sb)
             }
+            (AppMode::CutSpring, AppMode::CutSpring) => true,
             _ => false,
         }
     }
