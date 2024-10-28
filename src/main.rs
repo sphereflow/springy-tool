@@ -633,6 +633,10 @@ pub struct SpringyApp {
     app_mode: AppMode,
     contraption: Contraption,
     gravity_on: bool,
+    draw_velocities: bool,
+    velocity_arrow_factor: Float,
+    draw_accelerations: bool,
+    acceleration_arrow_factor: Float,
     gravity: V2,
     node_radius: Float,
     grid_config: GridConfig,
@@ -652,6 +656,10 @@ impl SpringyApp {
             app_mode: AppMode::NodeSelected { node_id: None },
             contraption: Contraption::new(),
             gravity_on: false,
+            draw_velocities: true,
+            velocity_arrow_factor: 0.1,
+            draw_accelerations: true,
+            acceleration_arrow_factor: 0.01,
             gravity: V2::new(0., 1000.),
             grid_config: GridConfig {
                 ty: GridType::Cross,
@@ -821,6 +829,81 @@ impl SpringyApp {
             self.contraption.add_grid(self.grid_config);
         }
     }
+
+    pub fn arrows_ui(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.draw_velocities, "Draw Velocities");
+            if self.draw_velocities {
+                ui.add(
+                    Slider::new(&mut self.velocity_arrow_factor, 0.001..=10.0).logarithmic(true),
+                );
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.draw_accelerations, "Draw Accelerations");
+            if self.draw_accelerations {
+                ui.add(
+                    Slider::new(&mut self.acceleration_arrow_factor, 0.001..=10.0)
+                        .logarithmic(true),
+                );
+            }
+        });
+    }
+
+    pub fn draw_contraption(&self) {
+        for node in &self.contraption.nodes {
+            let pos = node.position;
+            if node.stationary {
+                draw_circle(pos.x as f32, pos.y as f32, node.radius as f32, RED);
+            } else {
+                draw_circle(pos.x as f32, pos.y as f32, node.radius as f32, GREEN);
+            }
+            let pos_a = node.position;
+            for attached in &node.attached {
+                if let Some(other_ix) = self.contraption.get_node_ix(attached.other_node_id) {
+                    let pos_b = self.contraption.nodes[other_ix].position;
+                    if let Some(spring) = attached.spring.upgrade() {
+                        let dist = pos_a.distance(pos_b);
+                        let resting_length = spring.borrow().resting_length;
+                        let max_len = spring.borrow().max_len;
+                        let stretch_factor = if dist < resting_length {
+                            (resting_length - dist) / resting_length
+                        } else {
+                            (dist - resting_length) / (max_len - resting_length)
+                        };
+                        let color =
+                            colorous::RED_YELLOW_GREEN.eval_continuous(1.0 - stretch_factor);
+                        draw_line(
+                            pos_a[0] as f32,
+                            pos_a[1] as f32,
+                            pos_b[0] as f32,
+                            pos_b[1] as f32,
+                            2.,
+                            macroquad::color::Color::from_rgba(color.r, color.g, color.b, 255),
+                        );
+                    }
+                }
+            }
+            if self.draw_velocities {
+                let mut velocity_color = BEIGE;
+                velocity_color.a = 0.5;
+                draw_vector(
+                    &node.position,
+                    &(node.velocity * self.velocity_arrow_factor),
+                    velocity_color,
+                );
+            }
+            if self.draw_accelerations {
+                let mut acceleration_color = VIOLET;
+                acceleration_color.a = 0.5;
+                draw_vector(
+                    &node.position,
+                    &(node.acceleration * self.acceleration_arrow_factor),
+                    acceleration_color,
+                );
+            }
+        }
+    }
 }
 
 #[macroquad::main("Springy")]
@@ -860,6 +943,7 @@ async fn main() {
                     ui.add(Slider::new(&mut delta_t, 0.0001..=0.1).logarithmic(true));
                 });
                 ui.checkbox(&mut app.gravity_on, "gravity");
+                app.arrows_ui(ui);
                 if ui.button("Select").clicked() {
                     app.app_mode = AppMode::NodeSelected { node_id: None };
                 }
@@ -968,9 +1052,7 @@ async fn main() {
                 }
             }
         }
-
-        draw_contraption(&app.contraption);
-
+        app.draw_contraption();
         // draw the frame
         egui_macroquad::draw();
         next_frame().await
@@ -1004,52 +1086,6 @@ fn pull_to_mouse(contraption: &mut Contraption, force: Float) {
         if dist > 0. {
             node.velocity += dir * (force * 10. / (dist + 10.));
         }
-    }
-}
-
-fn draw_contraption(contraption: &Contraption) {
-    for node in &contraption.nodes {
-        let pos = node.position;
-        if node.stationary {
-            draw_circle(pos.x as f32, pos.y as f32, node.radius as f32, RED);
-        } else {
-            draw_circle(pos.x as f32, pos.y as f32, node.radius as f32, GREEN);
-        }
-        let pos_a = node.position;
-        for attached in &node.attached {
-            if let Some(other_ix) = contraption.get_node_ix(attached.other_node_id) {
-                let pos_b = contraption.nodes[other_ix].position;
-                if let Some(spring) = attached.spring.upgrade() {
-                    let dist = pos_a.distance(pos_b);
-                    let resting_length = spring.borrow().resting_length;
-                    let max_len = spring.borrow().max_len;
-                    let stretch_factor = if dist < resting_length {
-                        (resting_length - dist) / resting_length
-                    } else {
-                        (dist - resting_length) / (max_len - resting_length)
-                    };
-                    let color = colorous::RED_YELLOW_GREEN.eval_continuous(1.0 - stretch_factor);
-                    draw_line(
-                        pos_a[0] as f32,
-                        pos_a[1] as f32,
-                        pos_b[0] as f32,
-                        pos_b[1] as f32,
-                        2.,
-                        macroquad::color::Color::from_rgba(color.r, color.g, color.b, 255),
-                    );
-                }
-            }
-        }
-        let mut velocity_color = BEIGE;
-        velocity_color.a = 0.5;
-        draw_vector(&node.position, &(node.velocity * 0.1), velocity_color);
-        let mut acceleration_color = VIOLET;
-        acceleration_color.a = 0.5;
-        draw_vector(
-            &node.position,
-            &(node.acceleration * 0.01),
-            acceleration_color,
-        );
     }
 }
 
