@@ -1,25 +1,28 @@
 use ::glam::DVec2;
+use ::glam::Vec2;
+use configs::GridConfig;
+use configs::GridType;
+use configs::NodeConfig;
 use core::f64;
-use egui::*;
+use egui::Slider;
+use egui::Ui;
+use egui::Window;
+use macroquad::math::Rect;
 use macroquad::prelude::*;
+use motor::Motor;
 use std::cmp::Ordering;
 pub(crate) use std::{
     cell::RefCell,
     fmt::Display,
     rc::{Rc, Weak},
 };
+pub mod configs;
+pub mod motor;
 
 type Float = f64;
 type V2 = DVec2;
 type P2 = DVec2;
 type NodeId = usize;
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum GridType {
-    Quad,
-    Triangle,
-    Cross,
-}
 
 #[derive(Debug, Clone)]
 pub struct Contraption {
@@ -62,6 +65,7 @@ impl Contraption {
         for (n, factor) in factors.iter().enumerate() {
             for (i, node) in self.nodes.iter().enumerate() {
                 if self.nodes[i].stationary {
+                    self.kps[n + 1][i] = node.position();
                     continue;
                 }
                 self.kps[n + 1][i] = node.position + factor * delta_t * self.kvs[n][i];
@@ -95,7 +99,7 @@ impl Contraption {
             self.nodes[i].velocity += delta_t * weighted_acc;
 
             // put all the nodes positions into kps[0]
-            self.kps[0][i] = self.nodes[i].position;
+            self.kps[0][i] = self.nodes[i].position();
             // put all the nodes velocities into kvs[0]
             self.kvs[0][i] = self.nodes[i].velocity;
         }
@@ -142,9 +146,19 @@ impl Contraption {
         }
         // fill in initial values
         for (i, node) in self.nodes.iter().enumerate() {
-            self.kps[0][i] = node.position;
+            self.kps[0][i] = node.position();
             self.kvs[0][i] = node.velocity;
             self.kaccs[0][i] = node.acceleration;
+        }
+    }
+
+    pub fn step_motors(&mut self, delta_t: Float) {
+        for node in self.nodes.iter_mut() {
+            if node.stationary {
+                if let Some(motor) = node.motor.as_mut() {
+                    motor.step(delta_t);
+                }
+            }
         }
     }
 
@@ -208,10 +222,29 @@ impl Contraption {
             acceleration: V2::ZERO,
             weight: radius * radius,
             stationary: false,
+            motor: None,
             attached: Vec::new(),
         };
         self.next_node_id += 1;
         self.nodes.push(node);
+    }
+
+    pub fn spring_exists_between(&self, node_id_a: NodeId, node_id_b: NodeId) -> bool {
+        if let Some(ixa) = self.get_node_ix(node_id_a) {
+            for attached in self.nodes[ixa].attached.iter() {
+                if attached.other_node_id == node_id_b {
+                    return true;
+                }
+            }
+        }
+        if let Some(ixb) = self.get_node_ix(node_id_b) {
+            for attached in self.nodes[ixb].attached.iter() {
+                if attached.other_node_id == node_id_a {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     pub fn insert_spring_on_indices(
@@ -233,6 +266,22 @@ impl Contraption {
             other_node_id: self.nodes[ixa].id,
         };
         self.nodes[ixb].attached.push(ab);
+    }
+
+    pub fn fully_connect(&mut self, node_ids: &[NodeId], spring_constant: Float, dampening: Float) {
+        for ida in node_ids.iter().copied() {
+            for idb in node_ids.iter().copied() {
+                if ida != idb && !self.spring_exists_between(ida, idb) {
+                    self.insert_spring(ida, idb, spring_constant, dampening);
+                }
+            }
+        }
+    }
+
+    pub fn apply_resting_length_factors(&self) {
+        for spring in self.springs.iter() {
+            spring.borrow_mut().apply_resting_length_factor();
+        }
     }
 
     pub fn add_grid(
@@ -324,7 +373,7 @@ impl Contraption {
     pub fn nearest_node_ix(&self, pos: &P2) -> Option<(usize, Float)> {
         let mut res = None;
         for (ix, node) in self.nodes.iter().enumerate() {
-            let new_dist = pos.distance_squared(node.position);
+            let new_dist = pos.distance_squared(node.position());
             if let Some((_, dist)) = res {
                 if new_dist < dist {
                     res = Some((ix, new_dist));
@@ -343,14 +392,14 @@ impl Contraption {
             for attached in node.attached.iter() {
                 if let Some(ix) = self.get_node_ix(attached.other_node_id) {
                     let other_node = &self.nodes[ix];
-                    let dirab = other_node.position - node.position;
+                    let dirab = other_node.position() - node.position();
                     if dirab.length() <= f64::EPSILON {
                         continue;
                     }
                     let dirba = -dirab;
                     // if to is closer to the spring than any of its nodes
-                    let a = to - node.position;
-                    let b = to - other_node.position;
+                    let a = to - node.position();
+                    let b = to - other_node.position();
                     if (dirab.dot(a) > 0.0) && (dirba.dot(b) > 0.0) {
                         // calculate the distance
                         let dirabn = dirab.normalize();
@@ -369,6 +418,28 @@ impl Contraption {
         res
     }
 
+    pub fn multi_select(&self, rect: &Rect) -> (Vec<NodeId>, Vec<Weak<RefCell<Spring>>>) {
+        let mut res = Vec::new();
+        let mut node_indices = Vec::new();
+        for (ix, node) in self.nodes.iter().enumerate() {
+            let pos =
+                macroquad::math::Vec2::new(node.position().x as f32, node.position().y as f32);
+            if rect.contains(pos) {
+                res.push(node.id);
+                node_indices.push(ix);
+            }
+        }
+        let mut springs = Vec::new();
+        for node_ix in node_indices.iter() {
+            for attached in self.nodes[*node_ix].attached.iter() {
+                if res.binary_search(&attached.other_node_id).is_ok() {
+                    springs.push(attached.spring.clone());
+                }
+            }
+        }
+        (res, springs)
+    }
+
     pub fn create_spring(
         &mut self,
         resting_length: Float,
@@ -378,6 +449,7 @@ impl Contraption {
         let spring = Spring {
             spring_constant,
             resting_length,
+            resting_length_factor: 1.0,
             damping_factor,
             min_len: 0.2 * resting_length,
             max_len: 5.0 * resting_length,
@@ -396,6 +468,7 @@ impl Contraption {
         let spring = Spring {
             spring_constant,
             resting_length,
+            resting_length_factor: 1.0,
             damping_factor,
             min_len: 0.25 * resting_length,
             max_len: 4.0 * resting_length,
@@ -418,7 +491,7 @@ impl Contraption {
         let mut delete_indices = Vec::new();
         for (node_ix, node) in self.nodes.iter().enumerate() {
             for (attached_ix, attached) in node.attached.iter().enumerate() {
-                if attached.is_destruct(&self.nodes, node.position) {
+                if attached.is_destruct(&self.nodes, node.position()) {
                     delete_indices.push((node_ix, attached_ix));
                 }
             }
@@ -462,7 +535,9 @@ impl Contraption {
             for attached in &node.attached {
                 if let Some(spring) = attached.spring.upgrade() {
                     if let Some(other_node_ix) = self.get_node_ix(attached.other_node_id) {
-                        let distance = node.position.distance(self.nodes[other_node_ix].position);
+                        let distance = node
+                            .position()
+                            .distance(self.nodes[other_node_ix].position());
                         energy += 0.25
                             * (spring.borrow().resting_length - distance).powi(2)
                             * spring.borrow().spring_constant;
@@ -474,22 +549,11 @@ impl Contraption {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct GridConfig {
-    ty: GridType,
-    node_distance: Float,
-    node_radius: Float,
-    spring_constant: Float,
-    spring_dampening: Float,
-    width: usize,
-    height: usize,
-    upper_left: P2,
-}
-
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Spring {
     spring_constant: Float,
     resting_length: Float,
+    resting_length_factor: Float,
     damping_factor: Float,
     min_len: Float,
     max_len: Float,
@@ -500,9 +564,57 @@ impl Spring {
         if *dir == V2::ZERO {
             V2::ZERO
         } else {
-            let diff = (1.0 - (self.resting_length / dir.length())) * dir;
+            let diff =
+                (1.0 - ((self.resting_length * self.resting_length_factor) / dir.length())) * dir;
             self.spring_constant * diff + self.damping_factor * vdiff.project_onto(*dir)
         }
+    }
+
+    pub fn apply_resting_length_factor(&mut self) {
+        self.resting_length *= self.resting_length_factor;
+        self.resting_length_factor = 1.0;
+    }
+
+    pub fn ui(&mut self, ui: &mut Ui) -> bool {
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            ui.label("spring constant");
+            changed |= ui
+                .add(Slider::new(&mut self.spring_constant, 0.0..=100000.0).logarithmic(true))
+                .changed();
+        });
+        ui.horizontal(|ui| {
+            ui.label("resting length factor");
+            changed |= ui
+                .add(Slider::new(&mut self.resting_length_factor, 0.0..=2.0))
+                .changed();
+        });
+        ui.horizontal(|ui| {
+            ui.label("min len");
+            changed |= ui
+                .add(Slider::new(
+                    &mut self.min_len,
+                    0.0..=(self.resting_length * self.resting_length_factor),
+                ))
+                .changed();
+        });
+        ui.horizontal(|ui| {
+            ui.label("max len");
+            changed |= ui
+                .add(Slider::new(
+                    &mut self.max_len,
+                    (self.resting_length * self.resting_length_factor)
+                        ..=(10.0 * self.resting_length * self.resting_length_factor),
+                ))
+                .changed();
+        });
+        ui.horizontal(|ui| {
+            ui.label("damping factor");
+            changed |= ui
+                .add(Slider::new(&mut self.damping_factor, 0.0..=100.0).logarithmic(true))
+                .changed();
+        });
+        changed
     }
 }
 
@@ -517,7 +629,7 @@ impl Attached {
         let node_ix = nodes
             .binary_search_by_key(&self.other_node_id, |n| n.id)
             .expect("relative_position(...) => missing node");
-        nodes[node_ix].position - main_node_position
+        nodes[node_ix].position() - main_node_position
     }
 
     pub fn length(&self, nodes: &[Node], main_node_position: P2) -> Float {
@@ -538,7 +650,7 @@ impl Attached {
             .binary_search_by_key(&self.other_node_id, |n| n.id)
             .expect("relative_position(...) => missing node");
         print!("Node@({})", nodes[node_ix]);
-        print!("Node@({:?})", main_node.position.to_array());
+        print!("Node@({:?})", main_node.position().to_array());
         println!();
     }
 }
@@ -552,6 +664,7 @@ pub struct Node {
     acceleration: V2,
     weight: Float,
     stationary: bool,
+    motor: Option<Motor>,
     attached: Vec<Attached>,
 }
 
@@ -571,52 +684,72 @@ impl Node {
             acceleration: V2::new(0., 0.),
             weight: radius * radius,
             stationary: false,
+            motor: None,
             attached: Vec::new(),
         }
     }
 
     pub fn bounds_collision(&mut self, width: Float, height: Float, elasticity: Float) {
         match (
-            self.position[0] < self.radius,
-            self.position[0] > (width - self.radius),
+            self.position()[0] < self.radius,
+            self.position()[0] > (width - self.radius),
         ) {
             (true, _) => {
                 if self.velocity[0] < 0. {
                     self.velocity[0] = -self.velocity[0];
                     self.velocity *= elasticity;
                 }
-                self.position[0] = self.radius;
+                self.position()[0] = self.radius;
             }
             (_, true) => {
                 if self.velocity[0] > 0. {
                     self.velocity[0] = -self.velocity[0];
                     self.velocity *= elasticity;
                 }
-                self.position[0] = width - self.radius;
+                self.position()[0] = width - self.radius;
             }
             (false, false) => { // actually no collision occurred => do nothing
             }
         }
         match (
-            self.position[1] < self.radius,
-            self.position[1] > (height - self.radius),
+            self.position()[1] < self.radius,
+            self.position()[1] > (height - self.radius),
         ) {
             (true, _) => {
                 if self.velocity[1] < 0. {
                     self.velocity[1] = -self.velocity[1];
                     self.velocity *= elasticity;
                 }
-                self.position[1] = self.radius;
+                self.position()[1] = self.radius;
             }
             (_, true) => {
                 if self.velocity[1] > 0. {
                     self.velocity[1] = -self.velocity[1];
                     self.velocity *= elasticity;
                 }
-                self.position[1] = height - self.radius;
+                self.position()[1] = height - self.radius;
             }
             (false, false) => { // actually no collision occurred => do nothing
             }
+        }
+    }
+
+    pub fn configure(&mut self, config: NodeConfig) {
+        self.stationary = config.stationary;
+        self.radius = config.node_radius;
+        self.motor = config.motor;
+        self.weight = self.radius.powi(2);
+    }
+
+    pub fn position(&self) -> P2 {
+        if self.stationary {
+            if let Some(motor) = self.motor {
+                motor.position(self.position)
+            } else {
+                self.position
+            }
+        } else {
+            self.position
         }
     }
 }
@@ -637,8 +770,9 @@ pub struct SpringyApp {
     velocity_arrow_factor: Float,
     draw_accelerations: bool,
     acceleration_arrow_factor: Float,
+    multi_selection_rect: Option<(Rect, Vec2)>,
     gravity: V2,
-    node_radius: Float,
+    node_config: NodeConfig,
     grid_config: GridConfig,
     create_spring_constant: Float,
     create_spring_dampening: Float,
@@ -660,6 +794,7 @@ impl SpringyApp {
             velocity_arrow_factor: 0.1,
             draw_accelerations: true,
             acceleration_arrow_factor: 0.01,
+            multi_selection_rect: None,
             gravity: V2::new(0., 1000.),
             grid_config: GridConfig {
                 ty: GridType::Cross,
@@ -671,9 +806,43 @@ impl SpringyApp {
                 height: 15,
                 upper_left: P2::new(200., 200.),
             },
-            node_radius: 10.0,
+            node_config: Default::default(),
             create_spring_constant: 10.0,
             create_spring_dampening: 10.0,
+        }
+    }
+
+    pub fn app_mode_ui(&mut self, ui: &mut Ui) {
+        let mut app_mode_changed = false;
+        if ui.button("Select").clicked() {
+            self.app_mode = AppMode::NodeSelected { node_id: None };
+            self.contraption.apply_resting_length_factors();
+            app_mode_changed = true;
+        }
+        if ui.button("MultiSelection").clicked() {
+            self.app_mode = AppMode::MultiSelection {
+                node_ids: Vec::new(),
+                springs: Vec::new(),
+            };
+            app_mode_changed = true;
+        }
+        if ui.button("Draw Node").clicked() {
+            self.app_mode = AppMode::PlaceNode;
+            app_mode_changed = true;
+        }
+        if ui.button("Draw Joints").clicked() {
+            self.app_mode = AppMode::SpringStart;
+            app_mode_changed = true;
+        }
+        if ui.button("Cut Spring").clicked() {
+            self.app_mode = AppMode::CutSpring;
+            app_mode_changed = true;
+        }
+        if ui.button("Clear").clicked() {
+            self.contraption.clear();
+        }
+        if app_mode_changed {
+            self.contraption.apply_resting_length_factors();
         }
     }
 
@@ -730,7 +899,7 @@ impl SpringyApp {
             AppMode::PlaceNode => {
                 ui.horizontal(|ui| {
                     ui.label("node radius");
-                    ui.add(Slider::new(&mut self.node_radius, radius_range));
+                    ui.add(Slider::new(&mut self.node_config.node_radius, radius_range));
                 });
             }
             _ => {}
@@ -780,56 +949,6 @@ impl SpringyApp {
         };
     }
 
-    fn grid_ui(&mut self, ui: &mut Ui) {
-        ui.separator();
-        ui.label("Grid:");
-        let grid_types = [GridType::Quad, GridType::Triangle, GridType::Cross];
-        ui.horizontal(|ui| {
-            ComboBox::from_label("grid_type")
-                .selected_text(format!("{:?}", self.grid_config.ty))
-                .show_ui(ui, |ui| {
-                    for gt in grid_types {
-                        ui.selectable_value(&mut self.grid_config.ty, gt, format!("{:?}", gt));
-                    }
-                });
-        });
-        ui.horizontal(|ui| {
-            ui.label("width");
-            ui.add(Slider::new(&mut self.grid_config.width, 1..=100));
-        });
-        ui.horizontal(|ui| {
-            ui.label("height");
-            ui.add(Slider::new(&mut self.grid_config.height, 1..=100));
-        });
-        ui.horizontal(|ui| {
-            ui.label("node distance");
-            ui.add(Slider::new(
-                &mut self.grid_config.node_distance,
-                1.0..=100.0,
-            ));
-        });
-        ui.horizontal(|ui| {
-            ui.label("node radius");
-            ui.add(Slider::new(&mut self.grid_config.node_radius, 1.0..=10.0));
-        });
-        ui.horizontal(|ui| {
-            ui.label("spring constant");
-            ui.add(Slider::new(
-                &mut self.grid_config.spring_constant,
-                10.0..=100000.0,
-            ));
-        });
-        ui.horizontal(|ui| {
-            ui.label("dampening");
-            ui.add(
-                Slider::new(&mut self.grid_config.spring_dampening, 0.0..=100.0).logarithmic(true),
-            );
-        });
-        if ui.button("create grid").clicked() {
-            self.contraption.add_grid(self.grid_config);
-        }
-    }
-
     pub fn arrows_ui(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.draw_velocities, "Draw Velocities");
@@ -850,18 +969,63 @@ impl SpringyApp {
         });
     }
 
+    pub fn multi_selection_ui(&mut self, ui: &mut Ui) {
+        if let AppMode::MultiSelection { node_ids, springs } = &self.app_mode {
+            let mut node_ids_iter = node_ids.iter();
+            let mut current_id = node_ids_iter.next();
+            if self.node_config.ui(ui) {
+                for node in self.contraption.nodes.iter_mut() {
+                    if Some(&node.id) == current_id {
+                        current_id = node_ids_iter.next();
+                        node.configure(self.node_config);
+                    }
+                }
+            }
+            let master_spring = springs.first();
+            if let Some(spring_ref) = master_spring {
+                if let Some(spring_rc) = spring_ref.upgrade() {
+                    if spring_rc.borrow_mut().ui(ui) {
+                        let mut copy_spring = *spring_rc.borrow();
+                        for weak_spring in springs.iter() {
+                            if let Some(spring_rc) = weak_spring.upgrade() {
+                                // resting length should not be modified by the UI
+                                // resting_length_factor should be instead
+                                copy_spring.resting_length = spring_rc.borrow().resting_length;
+                                spring_rc.replace(copy_spring);
+                            }
+                        }
+                    }
+                }
+            }
+            if ui.button("fully connect").clicked() {
+                self.contraption.fully_connect(node_ids, 1000.0, 4.0);
+            }
+        }
+    }
+
     pub fn draw_contraption(&self) {
         for node in &self.contraption.nodes {
-            let pos = node.position;
+            let pos = node.position();
             if node.stationary {
                 draw_circle(pos.x as f32, pos.y as f32, node.radius as f32, RED);
             } else {
                 draw_circle(pos.x as f32, pos.y as f32, node.radius as f32, GREEN);
             }
-            let pos_a = node.position;
+            if let AppMode::MultiSelection {
+                node_ids,
+                springs: _,
+            } = &self.app_mode
+            {
+                if node_ids.binary_search(&node.id).is_ok() {
+                    let mut orange = SKYBLUE;
+                    orange.a = 0.5;
+                    draw_circle(pos.x as f32, pos.y as f32, 2.0 * node.radius as f32, orange);
+                }
+            }
+            let pos_a = node.position();
             for attached in &node.attached {
                 if let Some(other_ix) = self.contraption.get_node_ix(attached.other_node_id) {
-                    let pos_b = self.contraption.nodes[other_ix].position;
+                    let pos_b = self.contraption.nodes[other_ix].position();
                     if let Some(spring) = attached.spring.upgrade() {
                         let dist = pos_a.distance(pos_b);
                         let resting_length = spring.borrow().resting_length;
@@ -871,8 +1035,8 @@ impl SpringyApp {
                         } else {
                             (dist - resting_length) / (max_len - resting_length)
                         };
-                        let color =
-                            colorous::RED_YELLOW_GREEN.eval_continuous(1.0 - stretch_factor);
+                        let color = colorous::RED_YELLOW_GREEN
+                            .eval_continuous((1.0 - stretch_factor).powi(4));
                         draw_line(
                             pos_a[0] as f32,
                             pos_a[1] as f32,
@@ -888,7 +1052,7 @@ impl SpringyApp {
                 let mut velocity_color = BEIGE;
                 velocity_color.a = 0.5;
                 draw_vector(
-                    &node.position,
+                    &node.position(),
                     &(node.velocity * self.velocity_arrow_factor),
                     velocity_color,
                 );
@@ -897,7 +1061,7 @@ impl SpringyApp {
                 let mut acceleration_color = VIOLET;
                 acceleration_color.a = 0.5;
                 draw_vector(
-                    &node.position,
+                    &node.position(),
                     &(node.acceleration * self.acceleration_arrow_factor),
                     acceleration_color,
                 );
@@ -943,38 +1107,75 @@ async fn main() {
                     ui.add(Slider::new(&mut delta_t, 0.0001..=0.1).logarithmic(true));
                 });
                 ui.checkbox(&mut app.gravity_on, "gravity");
+                app.app_mode_ui(ui);
                 app.arrows_ui(ui);
-                if ui.button("Select").clicked() {
-                    app.app_mode = AppMode::NodeSelected { node_id: None };
-                }
-                if ui.button("Draw Node").clicked() {
-                    app.app_mode = AppMode::PlaceNode;
-                }
-                if ui.button("Draw Joints").clicked() {
-                    app.app_mode = AppMode::SpringStart;
-                }
-                if ui.button("Cut Spring").clicked() {
-                    app.app_mode = AppMode::CutSpring;
-                }
-                if ui.button("Clear").clicked() {
-                    app.contraption.clear();
-                }
                 app.spring_ui(ui);
                 app.node_ui(ui);
-                app.grid_ui(ui);
+                app.multi_selection_ui(ui);
+                app.grid_config.ui(ui, &mut app.contraption);
                 ui.label("spring velocities:");
             });
             mouse_hover = ctx.is_pointer_over_area();
         });
 
+        // MultiSelection: store the mouse position where the selection starts
+        if !mouse_hover && is_mouse_button_pressed(MouseButton::Left) {
+            if let AppMode::MultiSelection { .. } = app.app_mode {
+                let mouse_pos = mouse_position();
+                app.multi_selection_rect = Some((
+                    macroquad::math::Rect::new(mouse_pos.0, mouse_pos.1, 0.0, 0.0),
+                    Vec2::new(mouse_pos.0, mouse_pos.1),
+                ));
+            }
+        }
+
+        // draw multiselection rect
+        if !mouse_hover && is_mouse_button_down(MouseButton::Left) {
+            if let AppMode::MultiSelection { .. } = app.app_mode {
+                if let Some((rect, start_pos)) = app.multi_selection_rect.as_mut() {
+                    let mut selection_rect_color = macroquad::color::SKYBLUE;
+                    selection_rect_color.a = 0.5;
+                    let mouse_pos = mouse_position();
+                    rect.w = (start_pos.x - mouse_pos.0).abs();
+                    rect.h = (start_pos.y - mouse_pos.1).abs();
+                    rect.x = start_pos.x.min(mouse_pos.0);
+                    rect.y = start_pos.y.min(mouse_pos.1);
+                    draw_rectangle(rect.x, rect.y, rect.w, rect.h, selection_rect_color);
+                }
+            }
+        }
+
         if !mouse_hover && is_mouse_button_released(MouseButton::Left) {
+            app.contraption.apply_resting_length_factors();
             match &mut app.app_mode {
                 AppMode::NodeSelected { node_id: _ } | AppMode::SpringSelected { spring: _ } => {
                     app.app_mode = app.select_nearest();
                 }
+                AppMode::MultiSelection { node_ids, springs } => {
+                    if let Some((rect, _)) = app.multi_selection_rect {
+                        if is_key_down(KeyCode::LeftControl) || is_key_down(KeyCode::RightControl) {
+                            let (add_node_ids, add_springs) = app.contraption.multi_select(&rect);
+                            node_ids.extend(add_node_ids.into_iter());
+                            node_ids.sort();
+                            node_ids.dedup();
+                            springs.extend(add_springs.into_iter());
+                            springs.sort_by_key(|weak_spring| weak_spring.as_ptr());
+                            springs.dedup_by_key(|weak_spring| weak_spring.as_ptr());
+                        } else {
+                            (*node_ids, *springs) = app.contraption.multi_select(&rect);
+                        }
+                        if let Some(id) = node_ids.first() {
+                            if let Some(ix) = app.contraption.get_node_ix(*id) {
+                                app.node_config = NodeConfig::from_node(&app.contraption.nodes[ix]);
+                            }
+                        }
+                    }
+                }
                 AppMode::PlaceNode => {
-                    app.contraption
-                        .insert_node(P2::new(mpos.0 as Float, mpos.1 as Float), app.node_radius);
+                    app.contraption.insert_node(
+                        P2::new(mpos.0 as Float, mpos.1 as Float),
+                        app.node_config.node_radius,
+                    );
                 }
                 AppMode::SpringStart => {
                     let mouse_position = P2::new(mpos.0 as Float, mpos.1 as Float);
@@ -1008,6 +1209,7 @@ async fn main() {
 
         if paused && is_key_released(KeyCode::S) {
             app.contraption.rk4(delta_t as Float);
+            app.contraption.step_motors(delta_t as Float);
         }
 
         // handle gravity_on
@@ -1037,6 +1239,7 @@ async fn main() {
                 }
                 app.contraption.spring_break();
             }
+            app.contraption.step_motors(elapsed);
         }
         if is_mouse_button_down(MouseButton::Right) && !mouse_hover {
             pull_to_mouse(&mut app.contraption, 50.);
@@ -1064,10 +1267,11 @@ fn disp_app_mode(ui: &mut Ui, mode: &AppMode) {
         ui.label("App Mode: ");
         match mode {
             AppMode::PlaceNode => ui.label("Draw Nodes"),
-            AppMode::SpringSelected { spring: _ } => ui.label("SpringSelected"),
-            AppMode::NodeSelected { node_id: _ } => ui.label("NodeSelected"),
+            AppMode::SpringSelected { .. } => ui.label("SpringSelected"),
+            AppMode::NodeSelected { .. } => ui.label("NodeSelected"),
+            AppMode::MultiSelection { .. } => ui.label("MultiSelection"),
             AppMode::SpringStart => ui.label("JointStart"),
-            AppMode::SpringEnd { node_a_id: _ } => ui.label("JointEnd"),
+            AppMode::SpringEnd { .. } => ui.label("JointEnd"),
             AppMode::CutSpring => ui.label("CutSpring"),
         }
     });
@@ -1117,11 +1321,21 @@ fn draw_vector(start_point: &P2, v: &V2, color: Color) {
 
 #[derive(Clone, Debug)]
 pub enum AppMode {
-    NodeSelected { node_id: Option<NodeId> },
-    SpringSelected { spring: Weak<RefCell<Spring>> },
+    MultiSelection {
+        node_ids: Vec<NodeId>,
+        springs: Vec<Weak<RefCell<Spring>>>,
+    },
+    NodeSelected {
+        node_id: Option<NodeId>,
+    },
+    SpringSelected {
+        spring: Weak<RefCell<Spring>>,
+    },
     PlaceNode,
     SpringStart,
-    SpringEnd { node_a_id: NodeId },
+    SpringEnd {
+        node_a_id: NodeId,
+    },
     CutSpring,
 }
 
