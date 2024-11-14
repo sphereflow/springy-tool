@@ -303,7 +303,24 @@ impl Contraption {
         // create all the nodes
         for y in 0..height {
             for x in 0..width {
-                let pos = upper_left + node_distance * V2::new(x as Float, y as Float);
+                let pos = match ty {
+                    GridType::Quad | GridType::QuadTriangle | GridType::Cross => {
+                        upper_left + node_distance * V2::new(x as Float, y as Float)
+                    }
+                    GridType::Triangle => {
+                        let nd2 = node_distance.powi(2);
+                        let height = (nd2 - nd2 / 4.0).sqrt();
+                        if y % 2 == 0 {
+                            upper_left + V2::new(x as Float * node_distance, y as Float * height)
+                        } else {
+                            upper_left
+                                + V2::new(
+                                    x as Float * node_distance - (node_distance / 2.0),
+                                    y as Float * height,
+                                )
+                        }
+                    }
+                };
                 nodes.push(Node::new(self.next_node_id, pos, node_radius));
                 self.next_node_id += 1;
             }
@@ -327,10 +344,28 @@ impl Contraption {
                 }
                 match ty {
                     GridType::Quad => {}
-                    GridType::Triangle => {
+                    GridType::QuadTriangle => {
                         if (x < (width - 1)) && (y < (height - 1)) {
                             let ixa = base_ix + x + y * width;
                             let ixb = ixa + 1 + width;
+                            self.insert_spring_on_indices(
+                                ixa,
+                                ixb,
+                                spring_constant,
+                                spring_dampening,
+                            );
+                        }
+                    }
+                    GridType::Triangle => {
+                        if (x < (width - 1)) && (y < (height - 1)) {
+                            let ixa = base_ix + x + y * width;
+                            let ixb = if (y % 2) == 0 {
+                                ixa + 1 + width
+                            } else if x == 0 {
+                                continue;
+                            } else {
+                                ixa - 1 + width
+                            };
                             self.insert_spring_on_indices(
                                 ixa,
                                 ixb,
@@ -1080,7 +1115,7 @@ impl SpringyApp {
                         let mut spring_color =
                             macroquad::color::Color::from_rgba(color.r, color.g, color.b, 255);
                         if let Some(nearest) = nearest_spring.as_ref() {
-                            if nearest.as_ptr() == Rc::downgrade(&spring).as_ptr() {
+                            if nearest.as_ptr() == attached.spring.as_ptr() {
                                 spring_color = PURPLE;
                             }
                         }

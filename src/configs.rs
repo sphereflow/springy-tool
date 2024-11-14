@@ -4,8 +4,9 @@ use egui::{ComboBox, Slider, Ui};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GridType {
     Quad,
-    Triangle,
+    QuadTriangle,
     Cross,
+    Triangle,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -24,7 +25,12 @@ impl GridConfig {
     pub fn ui(&mut self, ui: &mut Ui, contraption: &mut Contraption) {
         ui.separator();
         ui.label("Grid:");
-        let grid_types = [GridType::Quad, GridType::Triangle, GridType::Cross];
+        let grid_types = [
+            GridType::Quad,
+            GridType::QuadTriangle,
+            GridType::Cross,
+            GridType::Triangle,
+        ];
         ui.horizontal(|ui| {
             ComboBox::from_label("grid_type")
                 .selected_text(format!("{:?}", self.ty))
