@@ -7,6 +7,7 @@ use core::f64;
 use egui::Slider;
 use egui::Ui;
 use egui::Window;
+use grid::Grid;
 use macroquad::math::Rect;
 use macroquad::prelude::*;
 use motor::Motor;
@@ -17,6 +18,7 @@ pub(crate) use std::{
     rc::{Rc, Weak},
 };
 pub mod configs;
+pub mod grid;
 pub mod motor;
 
 type Float = f64;
@@ -418,26 +420,39 @@ impl Contraption {
         res
     }
 
-    pub fn multi_select(&self, rect: &Rect) -> (Vec<NodeId>, Vec<Weak<RefCell<Spring>>>) {
-        let mut res = Vec::new();
+    pub fn multi_select(
+        &self,
+        rect: &Rect,
+        previous_nodes: &[NodeId],
+    ) -> (Vec<NodeId>, Vec<Weak<RefCell<Spring>>>) {
+        let mut node_ids = Vec::from_iter(previous_nodes.iter().copied());
         let mut node_indices = Vec::new();
+        for id in node_ids.iter() {
+            if let Some(ix) = self.get_node_ix(*id) {
+                node_indices.push(ix);
+            }
+        }
         for (ix, node) in self.nodes.iter().enumerate() {
             let pos =
                 macroquad::math::Vec2::new(node.position().x as f32, node.position().y as f32);
             if rect.contains(pos) {
-                res.push(node.id);
+                node_ids.push(node.id);
                 node_indices.push(ix);
             }
         }
+        node_ids.sort();
+        node_ids.dedup();
+        node_indices.sort();
+        node_indices.dedup();
         let mut springs = Vec::new();
         for node_ix in node_indices.iter() {
             for attached in self.nodes[*node_ix].attached.iter() {
-                if res.binary_search(&attached.other_node_id).is_ok() {
+                if node_ids.binary_search(&attached.other_node_id).is_ok() {
                     springs.push(attached.spring.clone());
                 }
             }
         }
-        (res, springs)
+        (node_ids, springs)
     }
 
     pub fn create_spring(
@@ -766,6 +781,7 @@ pub struct SpringyApp {
     app_mode: AppMode,
     contraption: Contraption,
     gravity_on: bool,
+    grid: Grid,
     draw_velocities: bool,
     velocity_arrow_factor: Float,
     draw_accelerations: bool,
@@ -790,6 +806,7 @@ impl SpringyApp {
             app_mode: AppMode::NodeSelected { node_id: None },
             contraption: Contraption::new(),
             gravity_on: false,
+            grid: Grid::default(),
             draw_velocities: true,
             velocity_arrow_factor: 0.1,
             draw_accelerations: true,
@@ -848,7 +865,7 @@ impl SpringyApp {
 
     /// select the nearest node or spring and conveniently return the coresponding AppMode
     pub fn select_nearest(&self) -> AppMode {
-        let mouse_pos = mouse_position();
+        let mouse_pos = self.grid.mouse_position();
         let mouse_pos = P2::new(mouse_pos.0 as Float, mouse_pos.1 as Float);
         let nearest_node = self.contraption.nearest_node_ix(&mouse_pos);
         let nearest_spring = self.contraption.nearest_spring(&mouse_pos);
@@ -1004,22 +1021,45 @@ impl SpringyApp {
     }
 
     pub fn draw_contraption(&self) {
-        for node in &self.contraption.nodes {
-            let pos = node.position();
-            if node.stationary {
-                draw_circle(pos.x as f32, pos.y as f32, node.radius as f32, RED);
-            } else {
-                draw_circle(pos.x as f32, pos.y as f32, node.radius as f32, GREEN);
+        for (node_ix, node) in self.contraption.nodes.iter().enumerate() {
+            let mut nearest_spring = None;
+            let mut nearest_node = None;
+            let mpos = self.grid.mouse_position();
+            let mpos = DVec2::new(mpos.0 as Float, mpos.1 as Float);
+            if let AppMode::NodeSelected { node_id: None } = &self.app_mode {
+                match (
+                    self.contraption.nearest_spring(&mpos),
+                    self.contraption.nearest_node_ix(&mpos),
+                ) {
+                    (None, None) => {}
+                    (None, Some((node_ix, _))) => nearest_node = Some(node_ix),
+                    (Some((spring, _)), None) => nearest_spring = Some(spring),
+                    (Some((spring, spring_dist)), Some((node_ix, node_dist))) => {
+                        if spring_dist < node_dist {
+                            nearest_spring = Some(spring);
+                        } else {
+                            nearest_node = Some(node_ix);
+                        }
+                    }
+                }
             }
+            let pos = node.position();
+            let mut node_color = GREEN;
+            if Some(node_ix) == nearest_node {
+                node_color = PURPLE;
+            } else if node.stationary {
+                node_color = RED;
+            }
+            draw_circle(pos.x as f32, pos.y as f32, node.radius as f32, node_color);
             if let AppMode::MultiSelection {
                 node_ids,
                 springs: _,
             } = &self.app_mode
             {
                 if node_ids.binary_search(&node.id).is_ok() {
-                    let mut orange = SKYBLUE;
-                    orange.a = 0.5;
-                    draw_circle(pos.x as f32, pos.y as f32, 2.0 * node.radius as f32, orange);
+                    let mut color = SKYBLUE;
+                    color.a = 0.5;
+                    draw_circle(pos.x as f32, pos.y as f32, 2.0 * node.radius as f32, color);
                 }
             }
             let pos_a = node.position();
@@ -1037,13 +1077,20 @@ impl SpringyApp {
                         };
                         let color = colorous::RED_YELLOW_GREEN
                             .eval_continuous((1.0 - stretch_factor).powi(4));
+                        let mut spring_color =
+                            macroquad::color::Color::from_rgba(color.r, color.g, color.b, 255);
+                        if let Some(nearest) = nearest_spring.as_ref() {
+                            if nearest.as_ptr() == Rc::downgrade(&spring).as_ptr() {
+                                spring_color = PURPLE;
+                            }
+                        }
                         draw_line(
                             pos_a[0] as f32,
                             pos_a[1] as f32,
                             pos_b[0] as f32,
                             pos_b[1] as f32,
                             2.,
-                            macroquad::color::Color::from_rgba(color.r, color.g, color.b, 255),
+                            spring_color,
                         );
                     }
                 }
@@ -1068,6 +1115,22 @@ impl SpringyApp {
             }
         }
     }
+
+    fn pull_to_mouse(&mut self, force: Float) {
+        let mpos = self.grid.mouse_position();
+        let mpos = P2::new(mpos.0 as Float, mpos.1 as Float);
+        for node in self.contraption.nodes.iter_mut() {
+            if node.stationary {
+                continue;
+            }
+            let dir = mpos - node.position;
+            let dist = dir.length();
+            let dir = dir.normalize();
+            if dist > 0. {
+                node.velocity += dir * (force * 10. / (dist + 10.));
+            }
+        }
+    }
 }
 
 #[macroquad::main("Springy")]
@@ -1083,7 +1146,7 @@ async fn main() {
     loop {
         let width = screen_width() as Float;
         let height = screen_height() as Float;
-        mpos = mouse_position();
+        mpos = app.grid.mouse_position();
         clear_background(BLACK);
         egui_macroquad::ui(|ctx| {
             Window::new("Springy").show(ctx, |ui| {
@@ -1109,6 +1172,7 @@ async fn main() {
                 ui.checkbox(&mut app.gravity_on, "gravity");
                 app.app_mode_ui(ui);
                 app.arrows_ui(ui);
+                app.grid.ui(ui);
                 app.spring_ui(ui);
                 app.node_ui(ui);
                 app.multi_selection_ui(ui);
@@ -1121,7 +1185,7 @@ async fn main() {
         // MultiSelection: store the mouse position where the selection starts
         if !mouse_hover && is_mouse_button_pressed(MouseButton::Left) {
             if let AppMode::MultiSelection { .. } = app.app_mode {
-                let mouse_pos = mouse_position();
+                let mouse_pos = app.grid.mouse_position();
                 app.multi_selection_rect = Some((
                     macroquad::math::Rect::new(mouse_pos.0, mouse_pos.1, 0.0, 0.0),
                     Vec2::new(mouse_pos.0, mouse_pos.1),
@@ -1135,7 +1199,7 @@ async fn main() {
                 if let Some((rect, start_pos)) = app.multi_selection_rect.as_mut() {
                     let mut selection_rect_color = macroquad::color::SKYBLUE;
                     selection_rect_color.a = 0.5;
-                    let mouse_pos = mouse_position();
+                    let mouse_pos = app.grid.mouse_position();
                     rect.w = (start_pos.x - mouse_pos.0).abs();
                     rect.h = (start_pos.y - mouse_pos.1).abs();
                     rect.x = start_pos.x.min(mouse_pos.0);
@@ -1154,15 +1218,11 @@ async fn main() {
                 AppMode::MultiSelection { node_ids, springs } => {
                     if let Some((rect, _)) = app.multi_selection_rect {
                         if is_key_down(KeyCode::LeftControl) || is_key_down(KeyCode::RightControl) {
-                            let (add_node_ids, add_springs) = app.contraption.multi_select(&rect);
-                            node_ids.extend(add_node_ids.into_iter());
-                            node_ids.sort();
-                            node_ids.dedup();
-                            springs.extend(add_springs.into_iter());
+                            (*node_ids, *springs) = app.contraption.multi_select(&rect, node_ids);
                             springs.sort_by_key(|weak_spring| weak_spring.as_ptr());
                             springs.dedup_by_key(|weak_spring| weak_spring.as_ptr());
                         } else {
-                            (*node_ids, *springs) = app.contraption.multi_select(&rect);
+                            (*node_ids, *springs) = app.contraption.multi_select(&rect, &[]);
                         }
                         if let Some(id) = node_ids.first() {
                             if let Some(ix) = app.contraption.get_node_ix(*id) {
@@ -1242,10 +1302,10 @@ async fn main() {
             app.contraption.step_motors(elapsed);
         }
         if is_mouse_button_down(MouseButton::Right) && !mouse_hover {
-            pull_to_mouse(&mut app.contraption, 50.);
+            app.pull_to_mouse(500.);
         }
         if is_mouse_button_down(MouseButton::Left) && (app.app_mode == AppMode::CutSpring) {
-            let mpos = mouse_position();
+            let mpos = app.grid.mouse_position();
             if let Some((spring_ref, dist)) = app
                 .contraption
                 .nearest_spring(&P2::new(mpos.0 as Float, mpos.1 as Float))
@@ -1256,6 +1316,10 @@ async fn main() {
             }
         }
         app.draw_contraption();
+        // draw the grid if shift is pressed
+        if is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift) {
+            app.grid.draw();
+        }
         // draw the frame
         egui_macroquad::draw();
         next_frame().await
@@ -1275,22 +1339,6 @@ fn disp_app_mode(ui: &mut Ui, mode: &AppMode) {
             AppMode::CutSpring => ui.label("CutSpring"),
         }
     });
-}
-
-fn pull_to_mouse(contraption: &mut Contraption, force: Float) {
-    let mpos = mouse_position();
-    let mpos = P2::new(mpos.0 as Float, mpos.1 as Float);
-    for node in contraption.nodes.iter_mut() {
-        if node.stationary {
-            continue;
-        }
-        let dir = mpos - node.position;
-        let dist = dir.length();
-        let dir = dir.normalize();
-        if dist > 0. {
-            node.velocity += dir * (force * 10. / (dist + 10.));
-        }
-    }
 }
 
 fn draw_vector(start_point: &P2, v: &V2, color: Color) {
