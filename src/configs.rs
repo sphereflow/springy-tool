@@ -7,6 +7,7 @@ pub enum GridType {
     QuadTriangle,
     Cross,
     Triangle,
+    Hex,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -30,6 +31,7 @@ impl GridConfig {
             GridType::QuadTriangle,
             GridType::Cross,
             GridType::Triangle,
+            GridType::Hex,
         ];
         ui.horizontal(|ui| {
             ComboBox::from_label("grid_type")

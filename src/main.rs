@@ -258,16 +258,16 @@ impl Contraption {
     ) {
         let node_distance = self.nodes[ixa].position.distance(self.nodes[ixb].position);
         self.create_spring(node_distance, spring_constant, spring_dampening);
-        let aa = Attached {
+        let ab = Attached {
             spring: Rc::downgrade(self.springs.last().unwrap()),
             other_node_id: self.nodes[ixb].id,
         };
-        self.nodes[ixa].attached.push(aa);
-        let ab = Attached {
+        self.nodes[ixa].attached.push(ab);
+        let ba = Attached {
             spring: Rc::downgrade(self.springs.last().unwrap()),
             other_node_id: self.nodes[ixa].id,
         };
-        self.nodes[ixb].attached.push(ab);
+        self.nodes[ixb].attached.push(ba);
     }
 
     pub fn fully_connect(&mut self, node_ids: &[NodeId], spring_constant: Float, dampening: Float) {
@@ -295,12 +295,18 @@ impl Contraption {
             spring_constant,
             spring_dampening,
             width,
-            height,
+            mut height,
             upper_left,
         }: GridConfig,
     ) {
         let mut nodes = Vec::new();
         // create all the nodes
+        let nd2 = node_distance.powi(2);
+        let tri_height = (nd2 - nd2 / 4.0).sqrt();
+        if ty == GridType::Hex {
+            height *= 2;
+            height += 1;
+        }
         for y in 0..height {
             for x in 0..width {
                 let pos = match ty {
@@ -308,39 +314,64 @@ impl Contraption {
                         upper_left + node_distance * V2::new(x as Float, y as Float)
                     }
                     GridType::Triangle => {
-                        let nd2 = node_distance.powi(2);
-                        let height = (nd2 - nd2 / 4.0).sqrt();
                         if y % 2 == 0 {
-                            upper_left + V2::new(x as Float * node_distance, y as Float * height)
+                            upper_left
+                                + V2::new(x as Float * node_distance, y as Float * tri_height)
                         } else {
                             upper_left
                                 + V2::new(
                                     x as Float * node_distance - (node_distance / 2.0),
-                                    y as Float * height,
+                                    y as Float * tri_height,
+                                )
+                        }
+                    }
+                    GridType::Hex => {
+                        if (y % 2) == 0 {
+                            upper_left
+                                + V2::new(x as Float * node_distance * 3., y as Float * tri_height)
+                        } else {
+                            upper_left
+                                + V2::new(
+                                    x as Float * node_distance * 3. - (node_distance / 2.0),
+                                    y as Float * tri_height,
                                 )
                         }
                     }
                 };
                 nodes.push(Node::new(self.next_node_id, pos, node_radius));
                 self.next_node_id += 1;
+                if ty == GridType::Hex {
+                    let pos2 = if (y % 2) == 0 {
+                        P2::new(pos.x + node_distance, pos.y)
+                    } else {
+                        P2::new(pos.x + 2. * node_distance, pos.y)
+                    };
+                    nodes.push(Node::new(self.next_node_id, pos2, node_radius));
+                    self.next_node_id += 1;
+                }
             }
         }
+        dbg!(nodes.len());
         let base_ix = self.nodes.len();
         self.nodes.extend_from_slice(&nodes);
+        dbg!(width, height);
         // link the nodes
         for y in 0..height {
             for x in 0..width {
-                // link horizontally
-                if x < (width - 1) {
-                    let ixa = base_ix + x + y * width;
-                    let ixb = ixa + 1;
-                    self.insert_spring_on_indices(ixa, ixb, spring_constant, spring_dampening);
-                }
-                // link vertically
-                if y < (height - 1) {
-                    let ixa = base_ix + x + y * width;
-                    let ixb = ixa + width;
-                    self.insert_spring_on_indices(ixa, ixb, spring_constant, spring_dampening);
+                // Hex grids are fully linked in the match statement bellow
+                if ty != GridType::Hex {
+                    // link horizontally
+                    if x < (width - 1) {
+                        let ixa = base_ix + x + y * width;
+                        let ixb = ixa + 1;
+                        self.insert_spring_on_indices(ixa, ixb, spring_constant, spring_dampening);
+                    }
+                    // link vertically
+                    if y < (height - 1) {
+                        let ixa = base_ix + x + y * width;
+                        let ixb = ixa + width;
+                        self.insert_spring_on_indices(ixa, ixb, spring_constant, spring_dampening);
+                    }
                 }
                 match ty {
                     GridType::Quad => {}
@@ -388,6 +419,52 @@ impl Contraption {
                         if (x > 0) && (y < (height - 1)) {
                             let ixa = base_ix + x + y * width;
                             let ixb = ixa - 1 + width;
+                            self.insert_spring_on_indices(
+                                ixa,
+                                ixb,
+                                spring_constant,
+                                spring_dampening,
+                            );
+                        }
+                    }
+                    GridType::Hex => {
+                        // left to right
+                        let ixa1 = base_ix + 2 * x + y * 2 * width + (y % 2);
+                        let ixb1 = ixa1 + 1;
+                        // make sure the x coordinate does not overshoot
+                        if 2 * x + 1 + (y % 2) < 2 * width {
+                            self.insert_spring_on_indices(
+                                ixa1,
+                                ixb1,
+                                spring_constant,
+                                spring_dampening,
+                            );
+                            //diagonally down right
+                            if y + 1 < height {
+                                let ixa3 = ixb1;
+                                let ixb3 = ixa3 + 2 * width;
+                                self.insert_spring_on_indices(
+                                    ixa3,
+                                    ixb3,
+                                    spring_constant,
+                                    spring_dampening,
+                                );
+                            }
+                        }
+                        if y + 1 < height {
+                            // diagonally down left
+                            let ixa2 = ixa1;
+                            let ixb2 = ixa2 + 2 * width;
+                            self.insert_spring_on_indices(
+                                ixa2,
+                                ixb2,
+                                spring_constant,
+                                spring_dampening,
+                            );
+                        }
+                        if x == 0 && (y % 2) == 1 && (y + 1 < height) {
+                            let ixa = y * 2 * width;
+                            let ixb = ixa + 2 * width;
                             self.insert_spring_on_indices(
                                 ixa,
                                 ixb,
