@@ -1195,31 +1195,36 @@ impl SpringyApp {
     }
 
     pub fn draw_contraption(&self) {
-        for (node_ix, node) in self.contraption.nodes.iter().enumerate() {
-            let mut nearest_spring = None;
-            let mut nearest_node = None;
-            let mpos = self.grid.mouse_position();
-            let mpos = DVec2::new(mpos.0 as Float, mpos.1 as Float);
-            if let AppMode::NodeSelected { node_id: None } = &self.app_mode {
-                match (
-                    self.contraption.nearest_spring(&mpos),
-                    self.contraption.nearest_node_ix(&mpos),
-                ) {
-                    (None, None) => {}
-                    (None, Some((node_ix, _))) => nearest_node = Some(node_ix),
-                    (Some((spring, _)), None) => nearest_spring = Some(spring),
-                    (Some((spring, spring_dist)), Some((node_ix, node_dist))) => {
-                        if spring_dist < node_dist {
-                            nearest_spring = Some(spring);
-                        } else {
-                            nearest_node = Some(node_ix);
-                        }
+        let mpos = self.grid.mouse_position();
+        let mpos = DVec2::new(mpos.0 as Float, mpos.1 as Float);
+        let mut nearest_spring = None;
+        let mut nearest_node = None;
+        if let AppMode::NodeSelected { node_id: None } = &self.app_mode {
+            match (
+                self.contraption.nearest_spring(&mpos),
+                self.contraption.nearest_node_ix(&mpos),
+            ) {
+                (None, None) => {}
+                (None, Some((node_ix, _))) => nearest_node = Some(node_ix),
+                (Some((spring, _)), None) => nearest_spring = Some(spring),
+                (Some((spring, spring_dist)), Some((node_ix, node_dist))) => {
+                    if spring_dist < node_dist {
+                        nearest_spring = Some(spring);
+                    } else {
+                        nearest_node = Some(node_ix);
                     }
                 }
             }
+        }
+        for (node_ix, node) in self.contraption.nodes.iter().enumerate() {
             let pos = node.position();
             let mut node_color = GREEN;
-            if Some(node_ix) == nearest_node {
+            if (AppMode::NodeSelected {
+                node_id: Some(node.id),
+            }) == self.app_mode
+            {
+                node_color = ORANGE;
+            } else if Some(node_ix) == nearest_node {
                 node_color = PURPLE;
             } else if node.stationary {
                 node_color = RED;
@@ -1253,7 +1258,12 @@ impl SpringyApp {
                             .eval_continuous((1.0 - stretch_factor).powi(4));
                         let mut spring_color =
                             macroquad::color::Color::from_rgba(color.r, color.g, color.b, 255);
-                        if let Some(nearest) = nearest_spring.as_ref() {
+                        if (AppMode::SpringSelected {
+                            spring: attached.spring.clone(),
+                        }) == self.app_mode
+                        {
+                            spring_color = ORANGE;
+                        } else if let Some(nearest) = nearest_spring.as_ref() {
                             if nearest.as_ptr() == attached.spring.as_ptr() {
                                 spring_color = PURPLE;
                             }
