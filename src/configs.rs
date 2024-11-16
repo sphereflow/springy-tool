@@ -17,6 +17,7 @@ pub struct GridConfig {
     pub node_radius: Float,
     pub spring_constant: Float,
     pub spring_dampening: Float,
+    pub spring_pretension_force: Float,
     pub width: usize,
     pub height: usize,
     pub upper_left: P2,
@@ -65,6 +66,12 @@ impl GridConfig {
         ui.horizontal(|ui| {
             ui.label("dampening");
             ui.add(Slider::new(&mut self.spring_dampening, 0.0..=100.0).logarithmic(true));
+        });
+        ui.horizontal(|ui| {
+            ui.label("pretension force");
+            ui.add(
+                Slider::new(&mut self.spring_pretension_force, 0.0..=100000.0).logarithmic(true),
+            );
         });
         if ui.button("create grid").clicked() {
             contraption.add_grid(*self);

@@ -12,6 +12,7 @@ use macroquad::math::Rect;
 use macroquad::prelude::*;
 use motor::Motor;
 use std::cmp::Ordering;
+use std::collections::HashMap;
 pub(crate) use std::{
     cell::RefCell,
     fmt::Display,
@@ -28,7 +29,8 @@ type NodeId = usize;
 
 #[derive(Debug, Clone)]
 pub struct Contraption {
-    pub nodes: Vec<Node>,
+    nodes: Vec<Node>,
+    node_map: HashMap<NodeId, usize>,
     next_node_id: NodeId,
     pub springs: Vec<Rc<RefCell<Spring>>>,
     // intermediate values for Runge Kutta
@@ -49,6 +51,7 @@ impl Contraption {
     pub fn new() -> Contraption {
         Contraption {
             nodes: Vec::new(),
+            node_map: HashMap::new(),
             next_node_id: 0,
             springs: Vec::new(),
             kps: [const { Vec::new() }; 4],
@@ -164,15 +167,34 @@ impl Contraption {
         }
     }
 
-    pub fn get_node_ix(&self, id: NodeId) -> Option<usize> {
-        if self.nodes.is_empty() {
-            return None;
-        }
-        let min_ix = 0;
-        let max_ix = id.min(self.nodes.len() - 1);
-        // println!("max_ix: {}, nodes.len(): {}", max_ix, self.nodes.len());
-        self.get_node_ix_min_max(id, min_ix, max_ix)
+    pub fn push_node(&mut self, mut node: Node) {
+        node.id = self.next_node_id;
+        self.node_map.insert(node.id, self.nodes.len());
+        self.nodes.push(node);
+        self.next_node_id += 1;
     }
+
+    #[inline(always)]
+    pub fn get_node_ix(&self, id: NodeId) -> Option<usize> {
+        self.node_map.get(&id).copied()
+    }
+
+    pub fn rehash_nodes(&mut self) {
+        self.node_map.clear();
+        for (ix, node) in self.nodes.iter().enumerate() {
+            self.node_map.insert(node.id, ix);
+        }
+    }
+
+    // pub fn get_node_ix(&self, id: NodeId) -> Option<usize> {
+    //     if self.nodes.is_empty() {
+    //         return None;
+    //     }
+    //     let min_ix = 0;
+    //     let max_ix = id.min(self.nodes.len() - 1);
+    //     // println!("max_ix: {}, nodes.len(): {}", max_ix, self.nodes.len());
+    //     self.get_node_ix_min_max(id, min_ix, max_ix)
+    // }
 
     fn get_node_ix_min_max(&self, id: NodeId, min_ix: usize, max_ix: usize) -> Option<usize> {
         if min_ix == max_ix {
@@ -196,12 +218,13 @@ impl Contraption {
         node_id_b: NodeId,
         spring_constant: Float,
         dampening: Float,
+        pretension_force: Float,
     ) {
         let ixa = self.get_node_ix(node_id_a);
         let ixb = self.get_node_ix(node_id_b);
         if let (Some(ixa), Some(ixb)) = (ixa, ixb) {
             let node_distance = self.nodes[ixa].position.distance(self.nodes[ixb].position);
-            self.create_spring(node_distance, spring_constant, dampening);
+            self.create_spring(node_distance, spring_constant, dampening, pretension_force);
             let aa = Attached {
                 spring: Rc::downgrade(self.springs.last().unwrap()),
                 other_node_id: self.nodes[ixb].id,
@@ -217,7 +240,7 @@ impl Contraption {
 
     pub fn insert_node(&mut self, position: P2, radius: Float) {
         let node = Node {
-            id: self.next_node_id,
+            id: 0,
             radius,
             position,
             velocity: V2::ZERO,
@@ -227,8 +250,7 @@ impl Contraption {
             motor: None,
             attached: Vec::new(),
         };
-        self.next_node_id += 1;
-        self.nodes.push(node);
+        self.push_node(node);
     }
 
     pub fn spring_exists_between(&self, node_id_a: NodeId, node_id_b: NodeId) -> bool {
@@ -255,9 +277,15 @@ impl Contraption {
         ixb: usize,
         spring_constant: Float,
         spring_dampening: Float,
+        spring_pretension_force: Float,
     ) {
         let node_distance = self.nodes[ixa].position.distance(self.nodes[ixb].position);
-        self.create_spring(node_distance, spring_constant, spring_dampening);
+        self.create_spring(
+            node_distance,
+            spring_constant,
+            spring_dampening,
+            spring_pretension_force,
+        );
         let ab = Attached {
             spring: Rc::downgrade(self.springs.last().unwrap()),
             other_node_id: self.nodes[ixb].id,
@@ -274,7 +302,7 @@ impl Contraption {
         for ida in node_ids.iter().copied() {
             for idb in node_ids.iter().copied() {
                 if ida != idb && !self.spring_exists_between(ida, idb) {
-                    self.insert_spring(ida, idb, spring_constant, dampening);
+                    self.insert_spring(ida, idb, spring_constant, dampening, 0.0);
                 }
             }
         }
@@ -294,6 +322,7 @@ impl Contraption {
             node_radius,
             spring_constant,
             spring_dampening,
+            spring_pretension_force,
             width,
             mut height,
             upper_left,
@@ -339,7 +368,6 @@ impl Contraption {
                     }
                 };
                 nodes.push(Node::new(self.next_node_id, pos, node_radius));
-                self.next_node_id += 1;
                 if ty == GridType::Hex {
                     let pos2 = if (y % 2) == 0 {
                         P2::new(pos.x + node_distance, pos.y)
@@ -347,14 +375,13 @@ impl Contraption {
                         P2::new(pos.x + 2. * node_distance, pos.y)
                     };
                     nodes.push(Node::new(self.next_node_id, pos2, node_radius));
-                    self.next_node_id += 1;
                 }
             }
         }
-        dbg!(nodes.len());
         let base_ix = self.nodes.len();
-        self.nodes.extend_from_slice(&nodes);
-        dbg!(width, height);
+        for node in nodes {
+            self.push_node(node);
+        }
         // link the nodes
         for y in 0..height {
             for x in 0..width {
@@ -364,13 +391,25 @@ impl Contraption {
                     if x < (width - 1) {
                         let ixa = base_ix + x + y * width;
                         let ixb = ixa + 1;
-                        self.insert_spring_on_indices(ixa, ixb, spring_constant, spring_dampening);
+                        self.insert_spring_on_indices(
+                            ixa,
+                            ixb,
+                            spring_constant,
+                            spring_dampening,
+                            spring_pretension_force,
+                        );
                     }
                     // link vertically
                     if y < (height - 1) {
                         let ixa = base_ix + x + y * width;
                         let ixb = ixa + width;
-                        self.insert_spring_on_indices(ixa, ixb, spring_constant, spring_dampening);
+                        self.insert_spring_on_indices(
+                            ixa,
+                            ixb,
+                            spring_constant,
+                            spring_dampening,
+                            spring_pretension_force,
+                        );
                     }
                 }
                 match ty {
@@ -384,6 +423,7 @@ impl Contraption {
                                 ixb,
                                 spring_constant,
                                 spring_dampening,
+                                spring_pretension_force,
                             );
                         }
                     }
@@ -402,6 +442,7 @@ impl Contraption {
                                 ixb,
                                 spring_constant,
                                 spring_dampening,
+                                spring_pretension_force,
                             );
                         }
                     }
@@ -414,6 +455,7 @@ impl Contraption {
                                 ixb,
                                 spring_constant,
                                 spring_dampening,
+                                spring_pretension_force,
                             );
                         }
                         if (x > 0) && (y < (height - 1)) {
@@ -424,6 +466,7 @@ impl Contraption {
                                 ixb,
                                 spring_constant,
                                 spring_dampening,
+                                spring_pretension_force,
                             );
                         }
                     }
@@ -438,6 +481,7 @@ impl Contraption {
                                 ixb1,
                                 spring_constant,
                                 spring_dampening,
+                                spring_pretension_force,
                             );
                             //diagonally down right
                             if y + 1 < height {
@@ -448,6 +492,7 @@ impl Contraption {
                                     ixb3,
                                     spring_constant,
                                     spring_dampening,
+                                    spring_pretension_force,
                                 );
                             }
                         }
@@ -460,6 +505,7 @@ impl Contraption {
                                 ixb2,
                                 spring_constant,
                                 spring_dampening,
+                                spring_pretension_force,
                             );
                         }
                         if x == 0 && (y % 2) == 1 && (y + 1 < height) {
@@ -470,6 +516,7 @@ impl Contraption {
                                 ixb,
                                 spring_constant,
                                 spring_dampening,
+                                spring_pretension_force,
                             );
                         }
                     }
@@ -572,11 +619,13 @@ impl Contraption {
         resting_length: Float,
         spring_constant: Float,
         damping_factor: Float,
+        pretension_force: Float,
     ) {
         let spring = Spring {
             spring_constant,
             resting_length,
             resting_length_factor: 1.0,
+            pretension_force,
             damping_factor,
             min_len: 0.2 * resting_length,
             max_len: 5.0 * resting_length,
@@ -596,6 +645,7 @@ impl Contraption {
             spring_constant,
             resting_length,
             resting_length_factor: 1.0,
+            pretension_force: 0.0,
             damping_factor,
             min_len: 0.25 * resting_length,
             max_len: 4.0 * resting_length,
@@ -653,6 +703,7 @@ impl Contraption {
     pub fn clear(&mut self) {
         self.springs.clear();
         self.nodes.clear();
+        self.node_map.clear();
     }
 
     pub fn energy(&self) -> Float {
@@ -681,6 +732,7 @@ pub struct Spring {
     spring_constant: Float,
     resting_length: Float,
     resting_length_factor: Float,
+    pretension_force: Float,
     damping_factor: Float,
     min_len: Float,
     max_len: Float,
@@ -691,9 +743,12 @@ impl Spring {
         if *dir == V2::ZERO {
             V2::ZERO
         } else {
-            let diff =
-                (1.0 - ((self.resting_length * self.resting_length_factor) / dir.length())) * dir;
-            self.spring_constant * diff + self.damping_factor * vdiff.project_onto(*dir)
+            // magnitude of the diff vector
+            let diffmag = 1.0 - ((self.resting_length * self.resting_length_factor) / dir.length());
+            let diff = diffmag * dir;
+            self.pretension_force * dir.normalize() * diffmag.signum()
+                + self.spring_constant * diff
+                + self.damping_factor * vdiff.project_onto(*dir)
         }
     }
 
@@ -714,6 +769,12 @@ impl Spring {
             ui.label("resting length factor");
             changed |= ui
                 .add(Slider::new(&mut self.resting_length_factor, 0.0..=2.0))
+                .changed();
+        });
+        ui.horizontal(|ui| {
+            ui.label("pretension force");
+            changed |= ui
+                .add(Slider::new(&mut self.pretension_force, 0.0..=100000.0).logarithmic(true))
                 .changed();
         });
         ui.horizontal(|ui| {
@@ -931,6 +992,7 @@ impl SpringyApp {
                 node_radius: 4.0,
                 spring_constant: 10000.0,
                 spring_dampening: 4.0,
+                spring_pretension_force: 0.0,
                 width: 15,
                 height: 15,
                 upper_left: P2::new(200., 200.),
@@ -1170,7 +1232,7 @@ impl SpringyApp {
             {
                 if node_ids.binary_search(&node.id).is_ok() {
                     let mut color = SKYBLUE;
-                    color.a = 0.5;
+                    color.a = 0.75;
                     draw_circle(pos.x as f32, pos.y as f32, 2.0 * node.radius as f32, color);
                 }
             }
@@ -1253,6 +1315,7 @@ async fn main() {
     let mut start = get_time();
     let mut stop;
     let mut delta_t = 0.001;
+    let mut compute_time = 0.;
     let mut step_elapsed;
     let mut paused: bool = false;
     loop {
@@ -1263,6 +1326,7 @@ async fn main() {
         egui_macroquad::ui(|ctx| {
             Window::new("Springy").show(ctx, |ui| {
                 ui.label(format!("Mouse: ({}, {})", mpos.0, mpos.1));
+                ui.label(format!("compute time: {:.2} ms", compute_time * 1000.));
                 ui.label(format!("num nodes: {}", app.contraption.nodes.len()));
                 ui.label(format!("energy: {}", app.contraption.energy()));
                 if paused {
@@ -1413,6 +1477,7 @@ async fn main() {
             }
             app.contraption.step_motors(elapsed);
         }
+        compute_time = get_time() - start;
         if is_mouse_button_down(MouseButton::Right) && !mouse_hover {
             app.pull_to_mouse(500.);
         }
