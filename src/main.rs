@@ -1,5 +1,6 @@
 use ::glam::DVec2;
 use ::glam::Vec2;
+use colorous::MAGMA;
 use configs::GridConfig;
 use configs::GridType;
 use configs::NodeConfig;
@@ -11,6 +12,7 @@ use grid::Grid;
 use macroquad::math::Rect;
 use macroquad::prelude::*;
 use motor::Motor;
+use spring::Spring;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 pub(crate) use std::{
@@ -21,6 +23,7 @@ pub(crate) use std::{
 pub mod configs;
 pub mod grid;
 pub mod motor;
+pub mod spring;
 
 type Float = f64;
 type V2 = DVec2;
@@ -680,6 +683,36 @@ impl Contraption {
         }
     }
 
+    /// ma : previous mouse position, mb : current mouse position
+    pub fn cut_springs(&mut self, ma: P2, mb: P2) {
+        let mut springs_to_cut = Vec::new();
+        for node in self.nodes.iter() {
+            let nap = node.position;
+            for attached in node.attached.iter() {
+                if let Some(ixb) = self.get_node_ix(attached.other_node_id) {
+                    let nbp = self.nodes[ixb].position;
+                    let va = ma - nap;
+                    let vb = mb - nap;
+                    let vc = nbp - ma;
+                    let vs = nbp - nap;
+                    let vm = mb - ma;
+                    if (vs.perp_dot(va) * vs.perp_dot(vb)) < 0.0
+                        && (vm.perp_dot(va) * vm.perp_dot(vc)) > 0.0
+                    {
+                        springs_to_cut.push(attached.spring.clone());
+                    }
+                }
+            }
+        }
+        springs_to_cut.sort_unstable_by_key(|s| s.as_ptr());
+        springs_to_cut.dedup_by_key(|s| s.as_ptr());
+        self.springs.retain(|spring_rc| {
+            springs_to_cut
+                .binary_search_by_key(&Rc::downgrade(spring_rc).as_ptr(), |weak| weak.as_ptr())
+                .is_err()
+        });
+    }
+
     pub fn delete_node(&mut self, node_id: NodeId) {
         if let Some(ix) = self.get_node_ix(node_id) {
             self.nodes.remove(ix);
@@ -724,85 +757,6 @@ impl Contraption {
             }
         }
         energy
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Spring {
-    spring_constant: Float,
-    resting_length: Float,
-    resting_length_factor: Float,
-    pretension_force: Float,
-    damping_factor: Float,
-    min_len: Float,
-    max_len: Float,
-}
-
-impl Spring {
-    fn force(&self, dir: &V2, vdiff: &V2) -> V2 {
-        if *dir == V2::ZERO {
-            V2::ZERO
-        } else {
-            // magnitude of the diff vector
-            let diffmag = 1.0 - ((self.resting_length * self.resting_length_factor) / dir.length());
-            let diff = diffmag * dir;
-            self.pretension_force * dir.normalize() * diffmag.signum()
-                + self.spring_constant * diff
-                + self.damping_factor * vdiff.project_onto(*dir)
-        }
-    }
-
-    pub fn apply_resting_length_factor(&mut self) {
-        self.resting_length *= self.resting_length_factor;
-        self.resting_length_factor = 1.0;
-    }
-
-    pub fn ui(&mut self, ui: &mut Ui) -> bool {
-        let mut changed = false;
-        ui.horizontal(|ui| {
-            ui.label("spring constant");
-            changed |= ui
-                .add(Slider::new(&mut self.spring_constant, 0.0..=100000.0).logarithmic(true))
-                .changed();
-        });
-        ui.horizontal(|ui| {
-            ui.label("resting length factor");
-            changed |= ui
-                .add(Slider::new(&mut self.resting_length_factor, 0.0..=2.0))
-                .changed();
-        });
-        ui.horizontal(|ui| {
-            ui.label("pretension force");
-            changed |= ui
-                .add(Slider::new(&mut self.pretension_force, 0.0..=100000.0).logarithmic(true))
-                .changed();
-        });
-        ui.horizontal(|ui| {
-            ui.label("min len");
-            changed |= ui
-                .add(Slider::new(
-                    &mut self.min_len,
-                    0.0..=(self.resting_length * self.resting_length_factor),
-                ))
-                .changed();
-        });
-        ui.horizontal(|ui| {
-            ui.label("max len");
-            changed |= ui
-                .add(Slider::new(
-                    &mut self.max_len,
-                    (self.resting_length * self.resting_length_factor)
-                        ..=(10.0 * self.resting_length * self.resting_length_factor),
-                ))
-                .changed();
-        });
-        ui.horizontal(|ui| {
-            ui.label("damping factor");
-            changed |= ui
-                .add(Slider::new(&mut self.damping_factor, 0.0..=100.0).logarithmic(true))
-                .changed();
-        });
-        changed
     }
 }
 
@@ -1038,8 +992,7 @@ impl SpringyApp {
     }
 
     /// select the nearest node or spring and conveniently return the coresponding AppMode
-    pub fn select_nearest(&self) -> AppMode {
-        let mouse_pos = self.grid.mouse_position();
+    pub fn select_nearest(&self, mouse_pos: (f32, f32)) -> AppMode {
         let mouse_pos = P2::new(mouse_pos.0 as Float, mouse_pos.1 as Float);
         let nearest_node = self.contraption.nearest_node_ix(&mouse_pos);
         let nearest_spring = self.contraption.nearest_spring(&mouse_pos);
@@ -1194,8 +1147,7 @@ impl SpringyApp {
         }
     }
 
-    pub fn draw_contraption(&self) {
-        let mpos = self.grid.mouse_position();
+    pub fn draw_contraption(&self, mpos: (f32, f32)) {
         let mpos = DVec2::new(mpos.0 as Float, mpos.1 as Float);
         let mut nearest_spring = None;
         let mut nearest_node = None;
@@ -1300,8 +1252,7 @@ impl SpringyApp {
         }
     }
 
-    fn pull_to_mouse(&mut self, force: Float) {
-        let mpos = self.grid.mouse_position();
+    fn pull_to_mouse(&mut self, mpos: (f32, f32), force: Float) {
         let mpos = P2::new(mpos.0 as Float, mpos.1 as Float);
         for node in self.contraption.nodes.iter_mut() {
             if node.stationary {
@@ -1320,7 +1271,8 @@ impl SpringyApp {
 #[macroquad::main("Springy")]
 async fn main() {
     let mut app = SpringyApp::new();
-    let mut mpos;
+    let mut mpos_prev;
+    let mut mpos = (0.0, 0.0);
     let mut mouse_hover = false;
     let mut start = get_time();
     let mut stop;
@@ -1331,6 +1283,7 @@ async fn main() {
     loop {
         let width = screen_width() as Float;
         let height = screen_height() as Float;
+        mpos_prev = mpos;
         mpos = app.grid.mouse_position();
         clear_background(BLACK);
         egui_macroquad::ui(|ctx| {
@@ -1338,6 +1291,7 @@ async fn main() {
                 ui.label(format!("Mouse: ({}, {})", mpos.0, mpos.1));
                 ui.label(format!("compute time: {:.2} ms", compute_time * 1000.));
                 ui.label(format!("num nodes: {}", app.contraption.nodes.len()));
+                ui.label(format!("num springs: {}", app.contraption.springs.len()));
                 ui.label(format!("energy: {}", app.contraption.energy()));
                 if paused {
                     if ui.button("play").clicked() {
@@ -1371,10 +1325,9 @@ async fn main() {
         // MultiSelection: store the mouse position where the selection starts
         if !mouse_hover && is_mouse_button_pressed(MouseButton::Left) {
             if let AppMode::MultiSelection { .. } = app.app_mode {
-                let mouse_pos = app.grid.mouse_position();
                 app.multi_selection_rect = Some((
-                    macroquad::math::Rect::new(mouse_pos.0, mouse_pos.1, 0.0, 0.0),
-                    Vec2::new(mouse_pos.0, mouse_pos.1),
+                    macroquad::math::Rect::new(mpos.0, mpos.1, 0.0, 0.0),
+                    Vec2::new(mpos.0, mpos.1),
                 ));
             }
         }
@@ -1385,11 +1338,10 @@ async fn main() {
                 if let Some((rect, start_pos)) = app.multi_selection_rect.as_mut() {
                     let mut selection_rect_color = macroquad::color::SKYBLUE;
                     selection_rect_color.a = 0.5;
-                    let mouse_pos = app.grid.mouse_position();
-                    rect.w = (start_pos.x - mouse_pos.0).abs();
-                    rect.h = (start_pos.y - mouse_pos.1).abs();
-                    rect.x = start_pos.x.min(mouse_pos.0);
-                    rect.y = start_pos.y.min(mouse_pos.1);
+                    rect.w = (start_pos.x - mpos.0).abs();
+                    rect.h = (start_pos.y - mpos.1).abs();
+                    rect.x = start_pos.x.min(mpos.0);
+                    rect.y = start_pos.y.min(mpos.1);
                     draw_rectangle(rect.x, rect.y, rect.w, rect.h, selection_rect_color);
                 }
             }
@@ -1399,7 +1351,7 @@ async fn main() {
             app.contraption.apply_resting_length_factors();
             match &mut app.app_mode {
                 AppMode::NodeSelected { node_id: _ } | AppMode::SpringSelected { spring: _ } => {
-                    app.app_mode = app.select_nearest();
+                    app.app_mode = app.select_nearest(mpos);
                 }
                 AppMode::MultiSelection { node_ids, springs } => {
                     if let Some((rect, _)) = app.multi_selection_rect {
@@ -1489,10 +1441,9 @@ async fn main() {
         }
         compute_time = get_time() - start;
         if is_mouse_button_down(MouseButton::Right) && !mouse_hover {
-            app.pull_to_mouse(500.);
+            app.pull_to_mouse(mpos, 500.);
         }
         if is_mouse_button_down(MouseButton::Left) && (app.app_mode == AppMode::CutSpring) {
-            let mpos = app.grid.mouse_position();
             if let Some((spring_ref, dist)) = app
                 .contraption
                 .nearest_spring(&P2::new(mpos.0 as Float, mpos.1 as Float))
@@ -1501,8 +1452,12 @@ async fn main() {
                     app.contraption.delete_spring(spring_ref);
                 }
             }
+
+            let ma = P2::new(mpos_prev.0 as Float, mpos_prev.1 as Float);
+            let mb = P2::new(mpos.0 as Float, mpos.1 as Float);
+            app.contraption.cut_springs(ma, mb);
         }
-        app.draw_contraption();
+        app.draw_contraption(mpos);
         // draw the grid if shift is pressed
         if is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift) {
             app.grid.draw();
