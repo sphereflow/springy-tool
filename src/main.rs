@@ -1,25 +1,24 @@
-use ::glam::DVec2;
-use ::glam::Vec2;
-use colorous::MAGMA;
-use configs::GridConfig;
-use configs::GridType;
-use configs::NodeConfig;
+use ::glam::{DVec2, Vec2};
+use configs::{GridConfig, GridType, NodeConfig};
 use core::f64;
-use egui::Slider;
-use egui::Ui;
-use egui::Window;
+use egui::{Slider, Ui, Window};
 use grid::Grid;
 use macroquad::math::Rect;
 use macroquad::prelude::*;
 use motor::Motor;
 use spring::Spring;
-use std::cmp::Ordering;
-use std::collections::HashMap;
 pub(crate) use std::{
     cell::RefCell,
     fmt::Display,
     rc::{Rc, Weak},
 };
+use std::{
+    cmp::Ordering,
+    collections::{HashMap, VecDeque},
+    f64::consts::PI,
+    time::{Duration, Instant},
+};
+
 pub mod configs;
 pub mod grid;
 pub mod motor;
@@ -528,6 +527,28 @@ impl Contraption {
         }
     }
 
+    pub fn add_circle(
+        &mut self,
+        center: P2,
+        radius: Float,
+        num_nodes: usize,
+        node_config: NodeConfig,
+    ) {
+        for i in 0..num_nodes {
+            let div = 2.0 * PI * i as Float / num_nodes as Float;
+            self.push_node(node_config.place(P2::new(div.sin(), div.cos()) * radius + center, 0));
+        }
+    }
+
+    pub fn merge(&mut self, other: &mut Contraption) {
+        for node in other.nodes.drain(..) {
+            self.push_node(node);
+        }
+        for spring in other.springs.drain(..) {
+            self.springs.push(spring);
+        }
+    }
+
     pub fn bounds_collision(&mut self, width: Float, height: Float, elasticity: Float) {
         for node in self.nodes.iter_mut() {
             node.bounds_collision(width, height, elasticity);
@@ -696,8 +717,8 @@ impl Contraption {
                     let vc = nbp - ma;
                     let vs = nbp - nap;
                     let vm = mb - ma;
-                    if (vs.perp_dot(va) * vs.perp_dot(vb)) < 0.0
-                        && (vm.perp_dot(va) * vm.perp_dot(vc)) > 0.0
+                    if (vs.perp_dot(va) * vs.perp_dot(vb)) <= 0.0
+                        && (vm.perp_dot(va) * vm.perp_dot(vc)) >= 0.0
                     {
                         springs_to_cut.push(attached.spring.clone());
                     }
@@ -907,6 +928,7 @@ impl Display for Node {
 pub struct SpringyApp {
     app_mode: AppMode,
     contraption: Contraption,
+    staging: Contraption,
     gravity_on: bool,
     grid: Grid,
     draw_velocities: bool,
@@ -919,6 +941,7 @@ pub struct SpringyApp {
     grid_config: GridConfig,
     create_spring_constant: Float,
     create_spring_dampening: Float,
+    middle_mouse: MiddleMouse,
 }
 
 impl Default for SpringyApp {
@@ -932,6 +955,7 @@ impl SpringyApp {
         SpringyApp {
             app_mode: AppMode::NodeSelected { node_id: None },
             contraption: Contraption::new(),
+            staging: Contraption::new(),
             gravity_on: false,
             grid: Grid::default(),
             draw_velocities: true,
@@ -954,6 +978,7 @@ impl SpringyApp {
             node_config: Default::default(),
             create_spring_constant: 10.0,
             create_spring_dampening: 10.0,
+            middle_mouse: Default::default(),
         }
     }
 
@@ -1091,6 +1116,19 @@ impl SpringyApp {
             }
             _ => {}
         };
+    }
+
+    pub fn circle_ui(&mut self, ui: &mut Ui) {
+        if ui.button("add circle").clicked() {
+            self.app_mode = AppMode::PlaceCircle {
+                radius: 50.0,
+                num_nodes: 4,
+                node_config: NodeConfig::default(),
+            };
+        }
+        if let AppMode::PlaceCircle { node_config, .. } = &mut self.app_mode {
+            node_config.ui(ui);
+        }
     }
 
     pub fn arrows_ui(&mut self, ui: &mut Ui) {
@@ -1231,6 +1269,8 @@ impl SpringyApp {
                     }
                 }
             }
+
+            // draw velocity and acceleration arrows
             if self.draw_velocities {
                 let mut velocity_color = BEIGE;
                 velocity_color.a = 0.5;
@@ -1250,6 +1290,29 @@ impl SpringyApp {
                 );
             }
         }
+
+        // draw staging area
+        for node in self.staging.nodes.iter() {
+            draw_circle(
+                node.position.x as f32,
+                node.position.y as f32,
+                node.radius as f32,
+                SKYBLUE,
+            );
+            for attached in node.attached.iter() {
+                if let Some(other_ix) = self.staging.get_node_ix(attached.other_node_id) {
+                    let other_pos = self.staging.nodes[other_ix].position;
+                    draw_line(
+                        node.position.x as f32,
+                        node.position.y as f32,
+                        other_pos.x as f32,
+                        other_pos.y as f32,
+                        3.0,
+                        SKYBLUE,
+                    );
+                }
+            }
+        }
     }
 
     fn pull_to_mouse(&mut self, mpos: (f32, f32), force: Float) {
@@ -1263,6 +1326,21 @@ impl SpringyApp {
             let dir = dir.normalize();
             if dist > 0. {
                 node.velocity += dir * (force * 10. / (dist + 10.));
+            }
+        }
+    }
+
+    pub fn update_middle_mouse(&mut self) {
+        self.middle_mouse.update();
+        if let AppMode::PlaceCircle {
+            radius,
+            num_nodes,
+            node_config: _,
+        } = &mut self.app_mode
+        {
+            match self.middle_mouse.change {
+                MiddleMouseChange::Radius => self.middle_mouse.update_float(radius),
+                MiddleMouseChange::NumNodes => self.middle_mouse.update_usize(num_nodes),
             }
         }
     }
@@ -1286,6 +1364,7 @@ async fn main() {
         mpos_prev = mpos;
         mpos = app.grid.mouse_position();
         clear_background(BLACK);
+        app.update_middle_mouse();
         egui_macroquad::ui(|ctx| {
             Window::new("Springy").show(ctx, |ui| {
                 ui.label(format!("Mouse: ({}, {})", mpos.0, mpos.1));
@@ -1315,6 +1394,7 @@ async fn main() {
                 app.grid.ui(ui);
                 app.spring_ui(ui);
                 app.node_ui(ui);
+                app.circle_ui(ui);
                 app.multi_selection_ui(ui);
                 app.grid_config.ui(ui, &mut app.contraption);
                 ui.label("spring velocities:");
@@ -1397,7 +1477,29 @@ async fn main() {
                         }
                     }
                 }
+                AppMode::PlaceCircle { .. } => {
+                    app.contraption.merge(&mut app.staging);
+                }
                 AppMode::CutSpring => {}
+            }
+        }
+
+        if !is_mouse_button_down(MouseButton::Left) {
+            app.staging.clear();
+        }
+        if !mouse_hover && !is_mouse_button_down(MouseButton::Left) {
+            if let AppMode::PlaceCircle {
+                radius,
+                num_nodes,
+                node_config,
+            } = app.app_mode
+            {
+                app.staging.add_circle(
+                    P2::new(mpos.0 as Float, mpos.1 as Float),
+                    radius,
+                    num_nodes,
+                    node_config,
+                );
             }
         }
 
@@ -1478,6 +1580,7 @@ fn disp_app_mode(ui: &mut Ui, mode: &AppMode) {
             AppMode::MultiSelection { .. } => ui.label("MultiSelection"),
             AppMode::SpringStart => ui.label("JointStart"),
             AppMode::SpringEnd { .. } => ui.label("JointEnd"),
+            AppMode::PlaceCircle { .. } => ui.label("PlaceCircle"),
             AppMode::CutSpring => ui.label("CutSpring"),
         }
     });
@@ -1509,6 +1612,93 @@ fn draw_vector(start_point: &P2, v: &V2, color: Color) {
     );
 }
 
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum MiddleMouseChange {
+    Radius,
+    NumNodes,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MiddleMouse {
+    last_scroll: Instant,
+    scroll_increase_threshold: Duration,
+    scroll_step: Float,
+    wheel: (f32, f32),
+    change: MiddleMouseChange,
+    scroll_timings: VecDeque<(Instant, f32)>,
+}
+
+impl Default for MiddleMouse {
+    fn default() -> Self {
+        Self {
+            last_scroll: Instant::now(),
+            scroll_increase_threshold: Duration::from_millis(100),
+            scroll_step: 1.0,
+            wheel: mouse_wheel(),
+            change: MiddleMouseChange::Radius,
+            scroll_timings: VecDeque::new(),
+        }
+    }
+}
+
+impl MiddleMouse {
+    pub fn update(&mut self) {
+        self.wheel = mouse_wheel();
+        if is_mouse_button_released(MouseButton::Middle) {
+            match self.change {
+                MiddleMouseChange::Radius => self.change = MiddleMouseChange::NumNodes,
+                MiddleMouseChange::NumNodes => self.change = MiddleMouseChange::Radius,
+            }
+        }
+        let now = Instant::now();
+        let passed = now - self.last_scroll;
+        self.scroll_timings.push_back((now, self.wheel.1));
+        if self.scroll_timings.len() > 10 {
+            self.scroll_timings.pop_front();
+        }
+        if self.wheel.1 != 0.0 {
+            if passed <= self.scroll_increase_threshold {
+                self.scroll_step *= 1.3;
+            }
+            self.last_scroll = now;
+        }
+        if (self.scroll_step > 1.5) && (passed >= self.scroll_increase_threshold) {
+            self.scroll_step /= 1.3;
+            self.last_scroll = now;
+        }
+    }
+
+    fn scroll_density(&self) -> f32 {
+        let mut acc = 0.0;
+        if let Some((start, _)) = self.scroll_timings.front() {
+            for (current_time, val) in self.scroll_timings.iter() {
+                let time = (*current_time - *start).as_secs_f32();
+                let numerator = *val * 1.5_f32.powf(time);
+                acc += numerator;
+            }
+        }
+        acc
+    }
+
+    pub fn update_float(&self, val: &mut Float) {
+        //*val += self.wheel.1 as Float * self.scroll_step;
+        let acc = self.scroll_density();
+        if acc != 0.0 {
+            dbg!(acc.powi(3));
+        }
+        let density = (acc.powi(3) - 0.19 * acc.signum()).abs().floor() * acc.signum();
+        *val += density as Float / 5.0;
+    }
+
+    pub fn update_usize(&self, val: &mut usize) {
+        let mut float_val = *val as f64;
+        let acc = self.scroll_density();
+        let density = (acc - 0.06 * acc.signum()).abs().floor() * acc.signum();
+        float_val += density as Float;
+        *val = float_val as usize;
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum AppMode {
     MultiSelection {
@@ -1525,6 +1715,11 @@ pub enum AppMode {
     SpringStart,
     SpringEnd {
         node_a_id: NodeId,
+    },
+    PlaceCircle {
+        radius: Float,
+        num_nodes: usize,
+        node_config: NodeConfig,
     },
     CutSpring,
 }
