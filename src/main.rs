@@ -20,6 +20,7 @@ use std::{
 };
 
 pub mod configs;
+pub mod egui_macroquad;
 pub mod grid;
 pub mod motor;
 pub mod spring;
