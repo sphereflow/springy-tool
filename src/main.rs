@@ -301,11 +301,29 @@ impl Contraption {
         self.nodes[ixb].attached.push(ba);
     }
 
-    pub fn fully_connect(&mut self, node_ids: &[NodeId], spring_constant: Float, dampening: Float) {
+    pub fn fully_connect(
+        &mut self,
+        node_ids: &[NodeId],
+        spring_constant: Float,
+        dampening: Float,
+        min_distance: Float,
+        max_distance: Float,
+    ) {
         for ida in node_ids.iter().copied() {
             for idb in node_ids.iter().copied() {
-                if ida != idb && !self.spring_exists_between(ida, idb) {
-                    self.insert_spring(ida, idb, spring_constant, dampening, 0.0);
+                if let Some(ixa) = self.get_node_ix(ida) {
+                    if let Some(ixb) = self.get_node_ix(idb) {
+                        let node_dist =
+                            (self.nodes[ixa].position() - self.nodes[ixb].position()).length();
+                        let distance_constraint =
+                            (min_distance..=max_distance).contains(&node_dist);
+                        if ida != idb
+                            && !self.spring_exists_between(ida, idb)
+                            && distance_constraint
+                        {
+                            self.insert_spring(ida, idb, spring_constant, dampening, 0.0);
+                        }
+                    }
                 }
             }
         }
@@ -945,6 +963,9 @@ pub struct SpringyApp {
     create_spring_constant: Float,
     create_spring_dampening: Float,
     middle_mouse: MiddleMouse,
+    min_fully_connect_distance: Float,
+    max_fully_connect_distance: Float,
+    pull_to_mouse_force: Float,
 }
 
 impl Default for SpringyApp {
@@ -982,6 +1003,9 @@ impl SpringyApp {
             create_spring_constant: 10.0,
             create_spring_dampening: 10.0,
             middle_mouse: Default::default(),
+            min_fully_connect_distance: 0.0,
+            max_fully_connect_distance: 2000.0,
+            pull_to_mouse_force: 200.0,
         }
     }
 
@@ -1014,6 +1038,10 @@ impl SpringyApp {
         if ui.button("Clear").clicked() {
             self.contraption.clear();
         }
+        ui.horizontal(|ui| {
+            ui.label("pull force");
+            ui.add(Slider::new(&mut self.pull_to_mouse_force, 0.0..=10000.0));
+        });
         if app_mode_changed {
             self.contraption.apply_resting_length_factors();
         }
@@ -1207,8 +1235,28 @@ impl SpringyApp {
                 }
             }
             if ui.button("fully connect").clicked() {
-                self.contraption.fully_connect(node_ids, 1000.0, 4.0);
+                self.contraption.fully_connect(
+                    node_ids,
+                    1000.0,
+                    4.0,
+                    self.min_fully_connect_distance,
+                    self.max_fully_connect_distance,
+                );
             }
+            ui.horizontal(|ui| {
+                ui.label("min distance");
+                ui.add(Slider::new(
+                    &mut self.min_fully_connect_distance,
+                    0.0..=self.max_fully_connect_distance,
+                ));
+            });
+            ui.horizontal(|ui| {
+                ui.label("max distance");
+                ui.add(Slider::new(
+                    &mut self.max_fully_connect_distance,
+                    self.min_fully_connect_distance..=2000.0,
+                ));
+            });
         }
     }
 
@@ -1342,7 +1390,7 @@ impl SpringyApp {
         }
     }
 
-    fn pull_to_mouse(&mut self, mpos: (f32, f32), force: Float) {
+    fn pull_to_mouse(&mut self, mpos: (f32, f32)) {
         let mpos = P2::new(mpos.0 as Float, mpos.1 as Float);
         for node in self.contraption.nodes.iter_mut() {
             if node.stationary {
@@ -1352,7 +1400,7 @@ impl SpringyApp {
             let dist = dir.length();
             let dir = dir.normalize();
             if dist > 0. {
-                node.velocity += dir * (force * 10. / (dist + 10.));
+                node.velocity += dir * (self.pull_to_mouse_force * 10. / (dist + 10.));
             }
         }
     }
@@ -1570,7 +1618,7 @@ async fn main() {
         }
         compute_time = get_time() - start;
         if is_mouse_button_down(MouseButton::Right) && !mouse_hover {
-            app.pull_to_mouse(mpos, 500.);
+            app.pull_to_mouse(mpos);
         }
         if is_mouse_button_down(MouseButton::Left) && (app.app_mode == AppMode::CutSpring) {
             if let Some((spring_ref, dist)) = app
