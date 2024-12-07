@@ -803,7 +803,9 @@ impl Attached {
     pub fn is_destruct(&self, nodes: &[Node], main_node_position: P2) -> bool {
         if let Some(spring_ref) = self.spring.upgrade() {
             let spring = spring_ref.borrow();
-            !(spring.min_len..=spring.max_len).contains(&self.length(nodes, main_node_position))
+            !((spring.min_len * spring.resting_length_factor)
+                ..=(spring.max_len * spring.resting_length_factor))
+                .contains(&self.length(nodes, main_node_position))
         } else {
             false
         }
@@ -1165,16 +1167,40 @@ impl SpringyApp {
                 }
             }
             let master_spring = springs.first();
-            if let Some(spring_ref) = master_spring {
-                if let Some(spring_rc) = spring_ref.upgrade() {
-                    if spring_rc.borrow_mut().ui(ui) {
-                        let mut copy_spring = *spring_rc.borrow();
+            if let Some(master_spring_ref) = master_spring {
+                if let Some(master_spring_rc) = master_spring_ref.upgrade() {
+                    let option_change = master_spring_rc.borrow_mut().ui(ui);
+                    if let Some(change) = option_change {
+                        let copy_spring = *master_spring_rc.borrow();
                         for weak_spring in springs.iter() {
-                            if let Some(spring_rc) = weak_spring.upgrade() {
+                            if let Some(copy_to_spring_rc) = weak_spring.upgrade() {
                                 // resting length should not be modified by the UI
                                 // resting_length_factor should be instead
-                                copy_spring.resting_length = spring_rc.borrow().resting_length;
-                                spring_rc.replace(copy_spring);
+                                if master_spring_rc.as_ref() == copy_to_spring_rc.as_ref() {
+                                    continue;
+                                }
+                                let mut spring = copy_to_spring_rc.borrow_mut();
+                                match change {
+                                    spring::SpringChange::Constant => {
+                                        spring.spring_constant = copy_spring.spring_constant
+                                    }
+                                    spring::SpringChange::RestingLengthFactor => {
+                                        spring.resting_length_factor =
+                                            copy_spring.resting_length_factor
+                                    }
+                                    spring::SpringChange::PretensionForce => {
+                                        spring.pretension_force = copy_spring.pretension_force
+                                    }
+                                    spring::SpringChange::DampingFactor => {
+                                        spring.damping_factor = copy_spring.damping_factor
+                                    }
+                                    spring::SpringChange::MinLength => {
+                                        spring.min_len = copy_spring.min_len
+                                    }
+                                    spring::SpringChange::MaxLength => {
+                                        spring.max_len = copy_spring.max_len
+                                    }
+                                }
                             }
                         }
                     }
@@ -1684,9 +1710,6 @@ impl MiddleMouse {
     pub fn update_float(&self, val: &mut Float) {
         //*val += self.wheel.1 as Float * self.scroll_step;
         let acc = self.scroll_density();
-        if acc != 0.0 {
-            dbg!(acc.powi(3));
-        }
         let density = (acc.powi(3) - 0.19 * acc.signum()).abs().floor() * acc.signum();
         *val += density as Float / 5.0;
     }
