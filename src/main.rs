@@ -30,6 +30,8 @@ type V2 = DVec2;
 type P2 = DVec2;
 type NodeId = usize;
 
+const NEAREST_NODE_OVER_SPRING_OFFSET: Float = 4.0;
+
 #[derive(Debug, Clone)]
 pub struct Contraption {
     nodes: Vec<Node>,
@@ -577,7 +579,7 @@ impl Contraption {
     pub fn nearest_node_ix(&self, pos: &P2) -> Option<(usize, Float)> {
         let mut res = None;
         for (ix, node) in self.nodes.iter().enumerate() {
-            let new_dist = pos.distance_squared(node.position());
+            let new_dist = pos.distance(node.position());
             if let Some((_, dist)) = res {
                 if new_dist < dist {
                     res = Some((ix, new_dist));
@@ -1065,7 +1067,8 @@ impl SpringyApp {
                 node_id: Some(self.contraption.nodes[node_ix].id),
             },
             (Some((node_ix, node_dist)), Some((spring, spring_dist))) => {
-                if node_dist < spring_dist {
+                // prefer nodes since they are harder to select
+                if node_dist <= (spring_dist + NEAREST_NODE_OVER_SPRING_OFFSET) {
                     AppMode::NodeSelected {
                         node_id: Some(self.contraption.nodes[node_ix].id),
                     }
@@ -1303,7 +1306,7 @@ impl SpringyApp {
                 (None, Some((node_ix, _))) => nearest_node = Some(node_ix),
                 (Some((spring, _)), None) => nearest_spring = Some(spring),
                 (Some((spring, spring_dist)), Some((node_ix, node_dist))) => {
-                    if spring_dist < node_dist {
+                    if (spring_dist + NEAREST_NODE_OVER_SPRING_OFFSET) < node_dist {
                         nearest_spring = Some(spring);
                     } else {
                         nearest_node = Some(node_ix);
