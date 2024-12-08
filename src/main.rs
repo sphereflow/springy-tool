@@ -1035,6 +1035,10 @@ impl SpringyApp {
             self.app_mode = AppMode::CutSpring;
             app_mode_changed = true;
         }
+        if ui.button("Grab Node").clicked() {
+            self.app_mode = AppMode::GrabNode { node_id: None };
+            app_mode_changed = true;
+        }
         if ui.button("Clear").clicked() {
             self.contraption.clear();
         }
@@ -1243,6 +1247,32 @@ impl SpringyApp {
                     self.max_fully_connect_distance,
                 );
             }
+            if let AppMode::MultiSelection { node_ids, springs } = &self.app_mode {
+                if ui.button("grab selection").clicked() {
+                    let mut nodes_offsets = Vec::new();
+                    let mut middle = P2::ZERO;
+                    let mut middle_count = 0.0;
+                    for id in node_ids {
+                        if let Some(ix) = self.contraption.get_node_ix(*id) {
+                            middle += self.contraption.nodes[ix].position();
+                            middle_count += 1.0;
+                        }
+                    }
+                    if middle_count != 0.0 {
+                        middle /= middle_count;
+                    }
+                    for id in node_ids {
+                        if let Some(ix) = self.contraption.get_node_ix(*id) {
+                            nodes_offsets
+                                .push((*id, self.contraption.nodes[ix].position() - middle));
+                        }
+                    }
+                    self.app_mode = AppMode::GrabSelection {
+                        node_ids_offsets: nodes_offsets,
+                        springs: springs.clone(),
+                    }
+                }
+            }
             ui.horizontal(|ui| {
                 ui.label("min distance");
                 ui.add(Slider::new(
@@ -1301,6 +1331,20 @@ impl SpringyApp {
             } = &self.app_mode
             {
                 if node_ids.binary_search(&node.id).is_ok() {
+                    let mut color = SKYBLUE;
+                    color.a = 0.75;
+                    draw_circle(pos.x as f32, pos.y as f32, 2.0 * node.radius as f32, color);
+                }
+            }
+            if let AppMode::GrabSelection {
+                node_ids_offsets,
+                springs: _,
+            } = &self.app_mode
+            {
+                if node_ids_offsets
+                    .binary_search_by_key(&node.id, |id_offset| id_offset.0)
+                    .is_ok()
+                {
                     let mut color = SKYBLUE;
                     color.a = 0.75;
                     draw_circle(pos.x as f32, pos.y as f32, 2.0 * node.radius as f32, color);
@@ -1556,6 +1600,8 @@ async fn main() {
                     app.contraption.merge(&mut app.staging);
                 }
                 AppMode::CutSpring => {}
+                AppMode::GrabNode { .. } => {}
+                AppMode::GrabSelection { .. } => {}
             }
         }
 
@@ -1634,6 +1680,36 @@ async fn main() {
             let mb = P2::new(mpos.0 as Float, mpos.1 as Float);
             app.contraption.cut_springs(ma, mb);
         }
+        if is_mouse_button_down(MouseButton::Left) && !mouse_hover {
+            let pos = P2::new(mpos.0 as Float, mpos.1 as Float);
+            if let AppMode::GrabNode {
+                node_id: Some(node_id),
+            } = app.app_mode
+            {
+                if let Some(ix) = app.contraption.get_node_ix(node_id) {
+                    app.contraption.nodes[ix].position = pos;
+                    app.contraption.nodes[ix].velocity = V2::ZERO;
+                }
+            } else if let AppMode::GrabNode { node_id: None } = app.app_mode {
+                if let Some((ix, _)) = app.contraption.nearest_node_ix(&pos) {
+                    app.app_mode = AppMode::GrabNode {
+                        node_id: Some(app.contraption.nodes[ix].id),
+                    }
+                }
+            }
+            if let AppMode::GrabSelection {
+                node_ids_offsets,
+                springs: _,
+            } = &app.app_mode
+            {
+                for (id, offset) in node_ids_offsets {
+                    if let Some(ix) = app.contraption.get_node_ix(*id) {
+                        app.contraption.nodes[ix].position = pos + offset;
+                        app.contraption.nodes[ix].velocity = V2::ZERO;
+                    }
+                }
+            }
+        }
         app.draw_contraption(mpos);
         // draw the grid if shift is pressed
         if is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift) {
@@ -1657,6 +1733,8 @@ fn disp_app_mode(ui: &mut Ui, mode: &AppMode) {
             AppMode::SpringEnd { .. } => ui.label("JointEnd"),
             AppMode::PlaceCircle { .. } => ui.label("PlaceCircle"),
             AppMode::CutSpring => ui.label("CutSpring"),
+            AppMode::GrabNode { .. } => ui.label("GrabNode"),
+            AppMode::GrabSelection { .. } => ui.label("GrabSelection"),
         }
     });
 }
@@ -1794,6 +1872,13 @@ pub enum AppMode {
         node_config: NodeConfig,
     },
     CutSpring,
+    GrabNode {
+        node_id: Option<NodeId>,
+    },
+    GrabSelection {
+        node_ids_offsets: Vec<(NodeId, P2)>,
+        springs: Vec<Weak<RefCell<Spring>>>,
+    },
 }
 
 impl PartialEq for AppMode {
@@ -1815,6 +1900,8 @@ impl PartialEq for AppMode {
                 sa.ptr_eq(sb)
             }
             (AppMode::CutSpring, AppMode::CutSpring) => true,
+            (AppMode::GrabNode { .. }, AppMode::GrabNode { .. }) => true,
+            (AppMode::GrabSelection { .. }, AppMode::GrabSelection { .. }) => true,
             _ => false,
         }
     }
