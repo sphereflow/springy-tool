@@ -6,17 +6,17 @@ use grid::Grid;
 use macroquad::math::Rect;
 use macroquad::prelude::*;
 use motor::Motor;
+use rayon::prelude::*;
 use spring::Spring;
-pub(crate) use std::{
-    cell::RefCell,
-    fmt::Display,
-    rc::{Rc, Weak},
-};
 use std::{
     cmp::Ordering,
     collections::{HashMap, VecDeque},
     f64::consts::PI,
     time::{Duration, Instant},
+};
+pub(crate) use std::{
+    fmt::Display,
+    sync::{Arc, RwLock, Weak},
 };
 
 pub mod configs;
@@ -37,7 +37,7 @@ pub struct Contraption {
     nodes: Vec<Node>,
     node_map: HashMap<NodeId, usize>,
     next_node_id: NodeId,
-    pub springs: Vec<Rc<RefCell<Spring>>>,
+    pub springs: Vec<Arc<RwLock<Spring>>>,
     // intermediate values for Runge Kutta
     // stored in the struct to avoid reallocations
     kps: [Vec<P2>; 4],
@@ -121,19 +121,130 @@ impl Contraption {
         }
     }
 
+    pub fn rk4_rayon(&mut self, delta_t: Float) {
+        let factors = [0.5, 0.5, 1.0];
+        self.rk4_init();
+
+        // Runge Kutta steps
+
+        for (n, factor) in factors.iter().enumerate() {
+            let [_, ref mut kpsnp1, ..] = &mut self.kps[n..] else {
+                panic!("Contraption::kps does not have enough elements")
+            };
+            let [ref kvsn, ref mut kvsnp1, ..] = &mut self.kvs[n..] else {
+                panic!("Contraption::kvs does not have enough elements")
+            };
+            let [ref kaccsn, ref mut kaccsnp1, ..] = &mut self.kaccs[n..] else {
+                panic!("Contraption::kaccs does not have enough elements")
+            };
+            (&self.nodes, kpsnp1, kvsn, kvsnp1, kaccsn)
+                .into_par_iter()
+                .for_each(|(node, kpnp1, kvn, kvnp1, kaccn)| {
+                    if node.stationary {
+                        *kpnp1 = node.position();
+                        return;
+                    }
+                    *kpnp1 = node.position + factor * delta_t * *kvn;
+                    *kvnp1 = node.velocity + factor * delta_t * *kaccn;
+                });
+
+            (&self.nodes, kaccsnp1)
+                .into_par_iter()
+                .enumerate()
+                .for_each(|(i, (node, kaccsnp1))| {
+                    *kaccsnp1 = self.g
+                        + Self::acceleration_par(
+                            &self.node_map,
+                            i,
+                            node,
+                            &self.kps[n + 1],
+                            &self.kvs[n + 1],
+                        );
+                });
+        }
+
+        // updating nodes
+        let [ref mut kp0s, ..] = self.kps;
+        let [ref mut kv0s, ref kv1s, ref kv2s, ref kv3s] = self.kvs;
+        let [ref kacc0s, ref kacc1s, ref kacc2s, ref kacc3s] = self.kaccs;
+
+        (
+            &mut self.nodes,
+            kp0s,
+            kv0s,
+            kv1s,
+            kv2s,
+            kv3s,
+            kacc0s,
+            kacc1s,
+            kacc2s,
+            kacc3s,
+        )
+            .into_par_iter()
+            .for_each(
+                |(node, kp0, kv0, kv1, kv2, kv3, kacc0, kacc1, kacc2, kacc3)| {
+                    if node.stationary {
+                        return;
+                    }
+                    // calculate position
+                    let weighted_v = (*kv0 + kv1 * 2.0 + kv2 * 2.0 + kv3) * (1.0 / 6.0);
+                    node.position += delta_t * weighted_v;
+
+                    // calculate velocity
+                    let weighted_acc = (kacc0 + kacc1 * 2.0 + kacc2 * 2.0 + kacc3) * (1.0 / 6.0);
+                    node.velocity += delta_t * weighted_acc;
+
+                    // put all the nodes positions into kps[0]
+                    *kp0 = node.position();
+                    // put all the nodes velocities into kvs[0]
+                    *kv0 = node.velocity;
+                },
+            );
+
+        // calculate acceleration
+        for i in 0..self.nodes.len() {
+            // use the positions and velocities of self.nodes which where collected in the previous loop
+            self.nodes[i].acceleration = self.g + self.acceleration(i, &self.kps[0], &self.kvs[0]);
+        }
+    }
+
     pub fn acceleration(&self, node_ix: usize, kps: &[P2], kvs: &[V2]) -> V2 {
-        let mut acc = V2::ZERO;
+        let mut forces = V2::ZERO;
         let node = &self.nodes[node_ix];
         for attached in node.attached.iter() {
             if let Some(spring) = attached.spring.upgrade() {
                 if let Some(other_ix) = self.get_node_ix(attached.other_node_id) {
                     let dir = kps[other_ix] - kps[node_ix];
                     let vdiff = kvs[other_ix] - kvs[node_ix];
-                    acc += spring.borrow().force(&dir, &vdiff) / self.nodes[node_ix].weight;
+                    if let Ok(spring) = spring.read() {
+                        forces += spring.force(&dir, &vdiff);
+                    }
                 }
             }
         }
-        acc
+        forces / node.weight
+    }
+
+    pub fn acceleration_par(
+        map: &HashMap<NodeId, usize>,
+        node_ix: usize,
+        node: &Node,
+        kps: &[P2],
+        kvs: &[V2],
+    ) -> V2 {
+        let mut forces = V2::ZERO;
+        for attached in node.attached.iter() {
+            if let Some(spring) = attached.spring.upgrade() {
+                if let Some(&other_ix) = map.get(&attached.other_node_id) {
+                    let dir = kps[other_ix] - kps[node_ix];
+                    let vdiff = kvs[other_ix] - kvs[node_ix];
+                    if let Ok(spring) = spring.read() {
+                        forces += spring.force(&dir, &vdiff);
+                    }
+                }
+            }
+        }
+        forces / node.weight
     }
 
     // initialize kps, kvs, kaccs
@@ -231,12 +342,12 @@ impl Contraption {
             let node_distance = self.nodes[ixa].position.distance(self.nodes[ixb].position);
             self.create_spring(node_distance, spring_constant, dampening, pretension_force);
             let aa = Attached {
-                spring: Rc::downgrade(self.springs.last().unwrap()),
+                spring: Arc::downgrade(self.springs.last().unwrap()),
                 other_node_id: self.nodes[ixb].id,
             };
             self.nodes[ixa].attached.push(aa);
             let ab = Attached {
-                spring: Rc::downgrade(self.springs.last().unwrap()),
+                spring: Arc::downgrade(self.springs.last().unwrap()),
                 other_node_id: self.nodes[ixa].id,
             };
             self.nodes[ixb].attached.push(ab);
@@ -292,12 +403,12 @@ impl Contraption {
             spring_pretension_force,
         );
         let ab = Attached {
-            spring: Rc::downgrade(self.springs.last().unwrap()),
+            spring: Arc::downgrade(self.springs.last().unwrap()),
             other_node_id: self.nodes[ixb].id,
         };
         self.nodes[ixa].attached.push(ab);
         let ba = Attached {
-            spring: Rc::downgrade(self.springs.last().unwrap()),
+            spring: Arc::downgrade(self.springs.last().unwrap()),
             other_node_id: self.nodes[ixa].id,
         };
         self.nodes[ixb].attached.push(ba);
@@ -333,7 +444,9 @@ impl Contraption {
 
     pub fn apply_resting_length_factors(&self) {
         for spring in self.springs.iter() {
-            spring.borrow_mut().apply_resting_length_factor();
+            if let Ok(mut spring_write) = spring.write() {
+                spring_write.apply_resting_length_factor();
+            }
         }
     }
 
@@ -570,9 +683,9 @@ impl Contraption {
         }
     }
 
-    pub fn bounds_collision(&mut self, width: Float, height: Float, elasticity: Float) {
+    pub fn bounds_collision(&mut self, width: Float, height: Float) {
         for node in self.nodes.iter_mut() {
-            node.bounds_collision(width, height, elasticity);
+            node.bounds_collision(width, height);
         }
     }
 
@@ -592,7 +705,7 @@ impl Contraption {
     }
 
     /// returns a reference to the spring and its distance
-    pub fn nearest_spring(&self, to: &P2) -> Option<(Weak<RefCell<Spring>>, Float)> {
+    pub fn nearest_spring(&self, to: &P2) -> Option<(Weak<RwLock<Spring>>, Float)> {
         let mut res = None;
         for node in self.nodes.iter() {
             for attached in node.attached.iter() {
@@ -628,7 +741,7 @@ impl Contraption {
         &self,
         rect: &Rect,
         previous_nodes: &[NodeId],
-    ) -> (Vec<NodeId>, Vec<Weak<RefCell<Spring>>>) {
+    ) -> (Vec<NodeId>, Vec<Weak<RwLock<Spring>>>) {
         let mut node_ids = Vec::from_iter(previous_nodes.iter().copied());
         let mut node_indices = Vec::new();
         for id in node_ids.iter() {
@@ -675,7 +788,7 @@ impl Contraption {
             min_len: 0.2 * resting_length,
             max_len: 5.0 * resting_length,
         };
-        self.springs.push(Rc::new(RefCell::new(spring)));
+        self.springs.push(Arc::new(RwLock::new(spring)));
     }
 
     pub fn create_spring_between(
@@ -695,15 +808,15 @@ impl Contraption {
             min_len: 0.25 * resting_length,
             max_len: 4.0 * resting_length,
         };
-        let spring_ref = Rc::new(RefCell::new(spring));
+        let spring_ref = Arc::new(RwLock::new(spring));
         self.springs.push(spring_ref.clone());
         let ata = Attached {
-            spring: Rc::downgrade(&spring_ref),
+            spring: Arc::downgrade(&spring_ref),
             other_node_id: self.nodes[ixb].id,
         };
         self.nodes[ixa].attached.push(ata);
         let atb = Attached {
-            spring: Rc::downgrade(&spring_ref),
+            spring: Arc::downgrade(&spring_ref),
             other_node_id: self.nodes[ixa].id,
         };
         self.nodes[ixb].attached.push(atb);
@@ -750,7 +863,7 @@ impl Contraption {
         springs_to_cut.dedup_by_key(|s| s.as_ptr());
         self.springs.retain(|spring_rc| {
             springs_to_cut
-                .binary_search_by_key(&Rc::downgrade(spring_rc).as_ptr(), |weak| weak.as_ptr())
+                .binary_search_by_key(&Arc::downgrade(spring_rc).as_ptr(), |weak| weak.as_ptr())
                 .is_err()
         });
     }
@@ -761,10 +874,10 @@ impl Contraption {
         }
     }
 
-    pub fn delete_spring(&mut self, spring_rc: Weak<RefCell<Spring>>) {
+    pub fn delete_spring(&mut self, spring_rc: Weak<RwLock<Spring>>) {
         let mut remove_ix = None;
         for (ix, spring) in self.springs.iter().enumerate() {
-            let downgraded = Rc::downgrade(spring);
+            let downgraded = Arc::downgrade(spring);
             if Weak::ptr_eq(&downgraded, &spring_rc) {
                 remove_ix = Some(ix);
                 break;
@@ -791,9 +904,11 @@ impl Contraption {
                         let distance = node
                             .position()
                             .distance(self.nodes[other_node_ix].position());
-                        energy += 0.25
-                            * (spring.borrow().resting_length - distance).powi(2)
-                            * spring.borrow().spring_constant;
+                        if let Ok(spring) = spring.read() {
+                            energy += 0.25
+                                * (spring.resting_length - distance).powi(2)
+                                * spring.spring_constant;
+                        }
                     }
                 }
             }
@@ -804,7 +919,7 @@ impl Contraption {
 
 #[derive(Debug, Clone)]
 pub struct Attached {
-    spring: Weak<RefCell<Spring>>,
+    spring: Weak<RwLock<Spring>>,
     other_node_id: NodeId,
 }
 
@@ -822,10 +937,13 @@ impl Attached {
 
     pub fn is_destruct(&self, nodes: &[Node], main_node_position: P2) -> bool {
         if let Some(spring_ref) = self.spring.upgrade() {
-            let spring = spring_ref.borrow();
-            !((spring.min_len * spring.resting_length_factor)
-                ..=(spring.max_len * spring.resting_length_factor))
-                .contains(&self.length(nodes, main_node_position))
+            if let Ok(spring) = spring_ref.read() {
+                !((spring.min_len * spring.resting_length_factor)
+                    ..=(spring.max_len * spring.resting_length_factor))
+                    .contains(&self.length(nodes, main_node_position))
+            } else {
+                false
+            }
         } else {
             false
         }
@@ -875,7 +993,7 @@ impl Node {
         }
     }
 
-    pub fn bounds_collision(&mut self, width: Float, height: Float, elasticity: Float) {
+    pub fn bounds_collision(&mut self, width: Float, height: Float) {
         match (
             self.position()[0] < self.radius,
             self.position()[0] > (width - self.radius),
@@ -883,14 +1001,12 @@ impl Node {
             (true, _) => {
                 if self.velocity[0] < 0. {
                     self.velocity[0] = -self.velocity[0];
-                    self.velocity *= elasticity;
                 }
                 self.position()[0] = self.radius;
             }
             (_, true) => {
                 if self.velocity[0] > 0. {
                     self.velocity[0] = -self.velocity[0];
-                    self.velocity *= elasticity;
                 }
                 self.position()[0] = width - self.radius;
             }
@@ -904,14 +1020,12 @@ impl Node {
             (true, _) => {
                 if self.velocity[1] < 0. {
                     self.velocity[1] = -self.velocity[1];
-                    self.velocity *= elasticity;
                 }
                 self.position()[1] = self.radius;
             }
             (_, true) => {
                 if self.velocity[1] > 0. {
                     self.velocity[1] = -self.velocity[1];
-                    self.velocity *= elasticity;
                 }
                 self.position()[1] = height - self.radius;
             }
@@ -968,6 +1082,7 @@ pub struct SpringyApp {
     min_fully_connect_distance: Float,
     max_fully_connect_distance: Float,
     pull_to_mouse_force: Float,
+    brayon: bool,
 }
 
 impl Default for SpringyApp {
@@ -992,13 +1107,13 @@ impl SpringyApp {
             gravity: V2::new(0., 1000.),
             grid_config: GridConfig {
                 ty: GridType::Cross,
-                node_distance: 30.0,
+                node_distance: 15.0,
                 node_radius: 4.0,
                 spring_constant: 10000.0,
                 spring_dampening: 4.0,
                 spring_pretension_force: 0.0,
-                width: 15,
-                height: 15,
+                width: 50,
+                height: 50,
                 upper_left: P2::new(200., 200.),
             },
             node_config: Default::default(),
@@ -1008,6 +1123,7 @@ impl SpringyApp {
             min_fully_connect_distance: 0.0,
             max_fully_connect_distance: 2000.0,
             pull_to_mouse_force: 200.0,
+            brayon: false,
         }
     }
 
@@ -1051,6 +1167,10 @@ impl SpringyApp {
         if app_mode_changed {
             self.contraption.apply_resting_length_factors();
         }
+    }
+
+    pub fn rayon_ui(&mut self, ui: &mut Ui) {
+        ui.checkbox(&mut self.brayon, "rayon");
     }
 
     /// select the nearest node or spring and conveniently return the coresponding AppMode
@@ -1119,21 +1239,22 @@ impl SpringyApp {
         match self.app_mode.clone() {
             AppMode::SpringSelected { spring } => {
                 if let Some(spring_cell) = spring.upgrade() {
-                    let mut spring_ref = spring_cell.borrow_mut();
-                    ui.horizontal(|ui| {
-                        ui.label("spring constant");
-                        ui.add(
-                            Slider::new(&mut spring_ref.spring_constant, spring_constant_range)
-                                .logarithmic(true),
-                        );
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("spring dampening");
-                        ui.add(
-                            Slider::new(&mut spring_ref.damping_factor, dampening_range)
-                                .logarithmic(true),
-                        );
-                    });
+                    if let Ok(mut spring_ref) = spring_cell.write() {
+                        ui.horizontal(|ui| {
+                            ui.label("spring constant");
+                            ui.add(
+                                Slider::new(&mut spring_ref.spring_constant, spring_constant_range)
+                                    .logarithmic(true),
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("spring dampening");
+                            ui.add(
+                                Slider::new(&mut spring_ref.damping_factor, dampening_range)
+                                    .logarithmic(true),
+                            );
+                        });
+                    }
                 }
             }
             AppMode::SpringStart | AppMode::SpringEnd { .. } => {
@@ -1204,36 +1325,42 @@ impl SpringyApp {
             let master_spring = springs.first();
             if let Some(master_spring_ref) = master_spring {
                 if let Some(master_spring_rc) = master_spring_ref.upgrade() {
-                    let option_change = master_spring_rc.borrow_mut().ui(ui);
-                    if let Some(change) = option_change {
-                        let copy_spring = *master_spring_rc.borrow();
-                        for weak_spring in springs.iter() {
-                            if let Some(copy_to_spring_rc) = weak_spring.upgrade() {
-                                // resting length should not be modified by the UI
-                                // resting_length_factor should be instead
-                                if master_spring_rc.as_ref() == copy_to_spring_rc.as_ref() {
-                                    continue;
-                                }
-                                let mut spring = copy_to_spring_rc.borrow_mut();
-                                match change {
-                                    spring::SpringChange::Constant => {
-                                        spring.spring_constant = copy_spring.spring_constant
-                                    }
-                                    spring::SpringChange::RestingLengthFactor => {
-                                        spring.resting_length_factor =
-                                            copy_spring.resting_length_factor
-                                    }
-                                    spring::SpringChange::PretensionForce => {
-                                        spring.pretension_force = copy_spring.pretension_force
-                                    }
-                                    spring::SpringChange::DampingFactor => {
-                                        spring.damping_factor = copy_spring.damping_factor
-                                    }
-                                    spring::SpringChange::MinLength => {
-                                        spring.min_len = copy_spring.min_len
-                                    }
-                                    spring::SpringChange::MaxLength => {
-                                        spring.max_len = copy_spring.max_len
+                    if let Ok(option_change) = master_spring_rc.write().map(|mut ms| ms.ui(ui)) {
+                        if let Some(change) = option_change {
+                            if let Ok(copy_spring) = master_spring_rc.read() {
+                                for weak_spring in springs.iter() {
+                                    if let Some(copy_to_spring_rc) = weak_spring.upgrade() {
+                                        // resting length should not be modified by the UI
+                                        // resting_length_factor should be instead
+                                        if Arc::ptr_eq(&master_spring_rc, &copy_to_spring_rc) {
+                                            continue;
+                                        }
+                                        if let Ok(mut spring) = copy_to_spring_rc.write() {
+                                            match change {
+                                                spring::SpringChange::Constant => {
+                                                    spring.spring_constant =
+                                                        copy_spring.spring_constant
+                                                }
+                                                spring::SpringChange::RestingLengthFactor => {
+                                                    spring.resting_length_factor =
+                                                        copy_spring.resting_length_factor
+                                                }
+                                                spring::SpringChange::PretensionForce => {
+                                                    spring.pretension_force =
+                                                        copy_spring.pretension_force
+                                                }
+                                                spring::SpringChange::DampingFactor => {
+                                                    spring.damping_factor =
+                                                        copy_spring.damping_factor
+                                                }
+                                                spring::SpringChange::MinLength => {
+                                                    spring.min_len = copy_spring.min_len
+                                                }
+                                                spring::SpringChange::MaxLength => {
+                                                    spring.max_len = copy_spring.max_len
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -1359,35 +1486,36 @@ impl SpringyApp {
                     let pos_b = self.contraption.nodes[other_ix].position();
                     if let Some(spring) = attached.spring.upgrade() {
                         let dist = pos_a.distance(pos_b);
-                        let resting_length = spring.borrow().resting_length;
-                        let max_len = spring.borrow().max_len;
-                        let stretch_factor = if dist < resting_length {
-                            (resting_length - dist) / resting_length
-                        } else {
-                            (dist - resting_length) / (max_len - resting_length)
-                        };
-                        let color = colorous::RED_YELLOW_GREEN
-                            .eval_continuous((1.0 - stretch_factor).powi(4));
-                        let mut spring_color =
-                            macroquad::color::Color::from_rgba(color.r, color.g, color.b, 255);
-                        if (AppMode::SpringSelected {
-                            spring: attached.spring.clone(),
-                        }) == self.app_mode
-                        {
-                            spring_color = ORANGE;
-                        } else if let Some(nearest) = nearest_spring.as_ref() {
-                            if nearest.as_ptr() == attached.spring.as_ptr() {
-                                spring_color = PURPLE;
+                        if let Ok(spring) = spring.read() {
+                            let max_len = spring.max_len;
+                            let stretch_factor = if dist < spring.resting_length {
+                                (spring.resting_length - dist) / spring.resting_length
+                            } else {
+                                (dist - spring.resting_length) / (max_len - spring.resting_length)
+                            };
+                            let color = colorous::RED_YELLOW_GREEN
+                                .eval_continuous((1.0 - stretch_factor).powi(4));
+                            let mut spring_color =
+                                macroquad::color::Color::from_rgba(color.r, color.g, color.b, 255);
+                            if (AppMode::SpringSelected {
+                                spring: attached.spring.clone(),
+                            }) == self.app_mode
+                            {
+                                spring_color = ORANGE;
+                            } else if let Some(nearest) = nearest_spring.as_ref() {
+                                if nearest.as_ptr() == attached.spring.as_ptr() {
+                                    spring_color = PURPLE;
+                                }
                             }
+                            draw_line(
+                                pos_a[0] as f32,
+                                pos_a[1] as f32,
+                                pos_b[0] as f32,
+                                pos_b[1] as f32,
+                                2.,
+                                spring_color,
+                            );
                         }
-                        draw_line(
-                            pos_a[0] as f32,
-                            pos_a[1] as f32,
-                            pos_b[0] as f32,
-                            pos_b[1] as f32,
-                            2.,
-                            spring_color,
-                        );
                     }
                 }
             }
@@ -1476,7 +1604,7 @@ async fn main() {
     let mut mouse_hover = false;
     let mut start = get_time();
     let mut stop;
-    let mut delta_t = 0.001;
+    let mut delta_t = 0.01;
     let mut compute_time = 0.;
     let mut step_elapsed;
     let mut paused: bool = false;
@@ -1512,6 +1640,7 @@ async fn main() {
                 });
                 ui.checkbox(&mut app.gravity_on, "gravity");
                 app.app_mode_ui(ui);
+                app.rayon_ui(ui);
                 app.arrows_ui(ui);
                 app.grid.ui(ui);
                 app.spring_ui(ui);
@@ -1652,13 +1781,21 @@ async fn main() {
         if !paused {
             loop {
                 // update contraption
-                app.contraption.bounds_collision(width, height, 0.9);
+                app.contraption.bounds_collision(width, height);
                 if (step_elapsed + delta_t) < elapsed {
-                    app.contraption.rk4(delta_t as Float);
+                    if app.brayon {
+                        app.contraption.rk4_rayon(delta_t as Float);
+                    } else {
+                        app.contraption.rk4(delta_t as Float);
+                    }
                     step_elapsed += delta_t;
                 } else {
                     // final step
-                    app.contraption.rk4((elapsed - step_elapsed) as Float);
+                    if app.brayon {
+                        app.contraption.rk4_rayon((elapsed - step_elapsed) as Float);
+                    } else {
+                        app.contraption.rk4((elapsed - step_elapsed) as Float);
+                    }
                     break;
                 }
                 app.contraption.spring_break();
@@ -1856,13 +1993,13 @@ impl MiddleMouse {
 pub enum AppMode {
     MultiSelection {
         node_ids: Vec<NodeId>,
-        springs: Vec<Weak<RefCell<Spring>>>,
+        springs: Vec<Weak<RwLock<Spring>>>,
     },
     NodeSelected {
         node_id: Option<NodeId>,
     },
     SpringSelected {
-        spring: Weak<RefCell<Spring>>,
+        spring: Weak<RwLock<Spring>>,
     },
     PlaceNode,
     SpringStart,
@@ -1880,7 +2017,7 @@ pub enum AppMode {
     },
     GrabSelection {
         node_ids_offsets: Vec<(NodeId, P2)>,
-        springs: Vec<Weak<RefCell<Spring>>>,
+        springs: Vec<Weak<RwLock<Spring>>>,
     },
 }
 
