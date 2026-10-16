@@ -1,4 +1,9 @@
-use crate::{motor::Motor, Contraption, Float, Node, NodeId, P2, V2};
+use crate::{
+    contraption::Contraption,
+    motor::Motor,
+    node::{Node, NodeId},
+    Float, P2,
+};
 use egui::{ComboBox, Slider, Ui};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -99,24 +104,17 @@ impl Default for NodeConfig {
 impl NodeConfig {
     pub fn from_node(node: &Node) -> Self {
         NodeConfig {
-            stationary: node.stationary,
-            node_radius: node.radius,
-            motor: node.motor,
+            stationary: node.is_stationary(),
+            node_radius: node.get_radius(),
+            motor: node.get_motor(),
         }
     }
 
     pub fn place(&self, position: P2, id: NodeId) -> Node {
-        Node {
-            id,
-            radius: self.node_radius,
-            position,
-            velocity: V2::ZERO,
-            acceleration: V2::ZERO,
-            weight: self.node_radius.powi(2),
-            stationary: self.stationary,
-            motor: self.motor,
-            attached: Vec::new(),
-        }
+        let mut node = Node::new(id, position, self.node_radius);
+        node.set_stationary(self.stationary);
+        node.set_motor(self.motor);
+        node
     }
 
     pub fn ui(&mut self, ui: &mut Ui) -> bool {

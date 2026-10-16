@@ -1,33 +1,23 @@
 use egui_miniquad::EguiMq;
 use macroquad::prelude::*;
-use miniquad as mq;
+use miniquad::{self as mq};
 
 pub use egui;
 pub use macroquad;
 
-struct Egui {
+pub struct Egui {
+    gl_ctx: InternalGlContext<'static>,
     egui_mq: EguiMq,
     input_subscriber_id: usize,
 }
 
-// Global variable and global functions because it's more like macroquad way
-static mut EGUI: Option<Egui> = None;
-
-fn get_egui() -> &'static mut Egui {
-    unsafe {
-        if let Some(egui) = EGUI.as_mut() {
-            egui
-        } else {
-            EGUI = Some(Egui::new());
-            EGUI.as_mut().unwrap()
-        }
-    }
-}
-
 impl Egui {
-    fn new() -> Self {
+    pub fn new() -> Self {
+        let gl_ctx = unsafe { get_internal_gl() };
+        let egui_mq = EguiMq::new(&mut *gl_ctx.quad_context);
         Self {
-            egui_mq: EguiMq::new(unsafe { get_internal_gl() }.quad_context),
+            gl_ctx,
+            egui_mq,
             input_subscriber_id: macroquad::input::utils::register_input_subscriber(),
         }
     }
@@ -36,40 +26,31 @@ impl Egui {
     where
         F: FnOnce(&mut dyn mq::RenderingBackend, &egui::Context),
     {
-        let gl = unsafe { get_internal_gl() };
         macroquad::input::utils::repeat_all_miniquad_input(self, self.input_subscriber_id);
 
-        self.egui_mq.run(gl.quad_context, f);
+        self.egui_mq.run(self.gl_ctx.quad_context, f);
     }
 
-    fn draw(&mut self) {
-        let mut gl = unsafe { get_internal_gl() };
+    pub fn draw(&mut self) {
         // Ensure that macroquad's shapes are not goint to be lost, and draw them now
-        gl.flush();
-        self.egui_mq.draw(gl.quad_context);
+        self.gl_ctx.flush();
+        self.egui_mq.draw(self.gl_ctx.quad_context);
+    }
+
+    /// Calculates egui ui. Must be called once per frame.
+    pub fn calc_ui<F: FnOnce(&egui::Context)>(&mut self, f: F) {
+        self.ui(|_, ctx| f(ctx))
+    }
+
+    /// Configure egui without beginning or ending a frame.
+    pub fn cfg<F: FnOnce(&egui::Context)>(&mut self, f: F) {
+        f(self.egui_mq.egui_ctx());
     }
 }
 
-/// Calculates egui ui. Must be called once per frame.
-pub fn ui<F: FnOnce(&egui::Context)>(f: F) {
-    get_egui().ui(|_, ctx| f(ctx))
-}
-
-/// Configure egui without beginning or ending a frame.
-pub fn cfg<F: FnOnce(&egui::Context)>(f: F) {
-    f(get_egui().egui_mq.egui_ctx());
-}
-
-/// Draw egui ui. Must be called after `ui` and once per frame.
-pub fn draw() {
-    get_egui().draw()
-}
-
-// Intended to be used only if you recreate the window, making the old EGUI instance invalid.
-#[doc(hidden)]
-pub fn reset_egui() {
-    unsafe {
-        EGUI = None;
+impl Default for Egui {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
