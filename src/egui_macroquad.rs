@@ -24,7 +24,7 @@ impl Egui {
 
     fn ui<F>(&mut self, f: F)
     where
-        F: FnOnce(&mut dyn mq::RenderingBackend, &egui::Context),
+        F: FnMut(&mut dyn mq::RenderingBackend, &egui::Context),
     {
         macroquad::input::utils::repeat_all_miniquad_input(self, self.input_subscriber_id);
 
@@ -38,7 +38,7 @@ impl Egui {
     }
 
     /// Calculates egui ui. Must be called once per frame.
-    pub fn calc_ui<F: FnOnce(&egui::Context)>(&mut self, f: F) {
+    pub fn calc_ui<F: FnMut(&egui::Context)>(&mut self, mut f: F) {
         self.ui(|_, ctx| f(ctx))
     }
 
