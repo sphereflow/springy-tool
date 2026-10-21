@@ -6,8 +6,6 @@ use egui::{Slider, Ui, Window};
 use grid::Grid;
 use macroquad::math::Rect;
 use macroquad::prelude::*;
-use spring::Spring;
-pub(crate) use std::sync::{Arc, RwLock, Weak};
 use std::{
     collections::VecDeque,
     time::{Duration, Instant},
@@ -16,13 +14,16 @@ use std::{
 use crate::{
     contraption::Contraption,
     egui_macroquad::Egui,
+    instanced_renderer::InstancedRenderer,
     node::{NEAREST_NODE_OVER_SPRING_OFFSET, NodeId},
+    spring::SpringId,
 };
 
 pub mod configs;
 pub mod contraption;
 pub mod egui_macroquad;
 pub mod grid;
+pub mod instanced_renderer;
 pub mod motor;
 pub mod node;
 pub mod spring;
@@ -51,6 +52,8 @@ pub struct SpringyApp {
     max_fully_connect_distance: Float,
     pull_to_mouse_force: Float,
     brayon: bool,
+    b_draw_instanced: bool,
+    instanced_renderer: InstancedRenderer,
 }
 
 impl Default for SpringyApp {
@@ -61,6 +64,8 @@ impl Default for SpringyApp {
 
 impl SpringyApp {
     pub fn new() -> Self {
+        let mut instanced_renderer = InstancedRenderer::new();
+        instanced_renderer.line_width = 4.0;
         SpringyApp {
             app_mode: AppMode::NodeSelected { node_id: None },
             contraption: Contraption::new(),
@@ -92,6 +97,8 @@ impl SpringyApp {
             max_fully_connect_distance: 2000.0,
             pull_to_mouse_force: 200.0,
             brayon: false,
+            b_draw_instanced: true,
+            instanced_renderer,
         }
     }
 
@@ -105,7 +112,7 @@ impl SpringyApp {
         if ui.button("MultiSelection").clicked() {
             self.app_mode = AppMode::MultiSelection {
                 node_ids: Vec::new(),
-                springs: Vec::new(),
+                spring_ids: Vec::new(),
             };
             app_mode_changed = true;
         }
@@ -148,9 +155,7 @@ impl SpringyApp {
         let nearest_spring = self.contraption.nearest_spring(&mouse_pos);
         match (nearest_node, nearest_spring) {
             (None, None) => AppMode::NodeSelected { node_id: None },
-            (None, Some((spring, _))) => AppMode::SpringSelected {
-                spring: spring.clone(),
-            },
+            (None, Some((spring, _))) => AppMode::SpringSelected { spring_id: spring },
             (Some((node_ix, _)), None) => AppMode::NodeSelected {
                 node_id: Some(self.contraption.get_node(node_ix).id),
             },
@@ -161,9 +166,7 @@ impl SpringyApp {
                         node_id: Some(self.contraption.get_node(node_ix).id),
                     }
                 } else {
-                    AppMode::SpringSelected {
-                        spring: spring.clone(),
-                    }
+                    AppMode::SpringSelected { spring_id: spring }
                 }
             }
         }
@@ -207,10 +210,9 @@ impl SpringyApp {
         let spring_constant_range = 0.0..=10000.0;
         let dampening_range = 0.0..=100.0;
         match self.app_mode.clone() {
-            AppMode::SpringSelected { spring } => {
-                if let Some(spring_cell) = spring.upgrade()
-                    && let Ok(mut spring_ref) = spring_cell.write()
-                {
+            AppMode::SpringSelected { spring_id } => {
+                if let Some(spring_ix) = self.contraption.get_spring_ix(spring_id) {
+                    let spring_ref = self.contraption.get_spring_mut(spring_ix);
                     ui.horizontal(|ui| {
                         ui.label("spring constant");
                         ui.add(
@@ -281,7 +283,11 @@ impl SpringyApp {
     }
 
     pub fn multi_selection_ui(&mut self, ui: &mut Ui) {
-        if let AppMode::MultiSelection { node_ids, springs } = &self.app_mode {
+        if let AppMode::MultiSelection {
+            node_ids,
+            spring_ids: springs,
+        } = &self.app_mode
+        {
             let mut node_ids_iter = node_ids.iter();
             let mut current_id = node_ids_iter.next();
             if self.node_config.ui(ui) {
@@ -292,21 +298,22 @@ impl SpringyApp {
                     }
                 }
             }
-            let master_spring = springs.first();
-            if let Some(master_spring_ref) = master_spring
-                && let Some(master_spring_rc) = master_spring_ref.upgrade()
-                && let Ok(option_change) = master_spring_rc.write().map(|mut ms| ms.ui(ui))
-                && let Some(change) = option_change
-                && let Ok(copy_spring) = master_spring_rc.read()
+            if let Some(master_spring_ix) = springs
+                .first()
+                .and_then(|id| self.contraption.get_spring_ix(*id))
             {
-                for weak_spring in springs.iter() {
-                    if let Some(copy_to_spring_rc) = weak_spring.upgrade() {
+                let master_spring = self.contraption.get_spring_mut(master_spring_ix);
+                let copy_spring = *master_spring; // copy by dereferencing
+                if let Some(change) = master_spring.ui(ui) {
+                    for spring_id in springs.iter() {
                         // resting length should not be modified by the UI
                         // resting_length_factor should be instead
-                        if Arc::ptr_eq(&master_spring_rc, &copy_to_spring_rc) {
+                        if copy_spring.id == *spring_id {
                             continue;
                         }
-                        if let Ok(mut spring) = copy_to_spring_rc.write() {
+                        if let Some(copy_to_spring_ix) = self.contraption.get_spring_ix(*spring_id)
+                        {
+                            let spring = self.contraption.get_spring_mut(copy_to_spring_ix);
                             match change {
                                 spring::SpringChange::Constant => {
                                     spring.spring_constant = copy_spring.spring_constant
@@ -341,7 +348,10 @@ impl SpringyApp {
                     self.max_fully_connect_distance,
                 );
             }
-            if let AppMode::MultiSelection { node_ids, springs } = &self.app_mode
+            if let AppMode::MultiSelection {
+                node_ids,
+                spring_ids: springs,
+            } = &self.app_mode
                 && ui.button("grab selection").clicked()
             {
                 let mut nodes_offsets = Vec::new();
@@ -364,7 +374,7 @@ impl SpringyApp {
                 }
                 self.app_mode = AppMode::GrabSelection {
                     node_ids_offsets: nodes_offsets,
-                    springs: springs.clone(),
+                    spring_ids: springs.clone(),
                 }
             }
             ui.horizontal(|ui| {
@@ -384,9 +394,9 @@ impl SpringyApp {
         }
     }
 
-    pub fn draw_contraption(&self, mpos: (f32, f32)) {
+    pub fn draw_contraption(&mut self, mpos: (f32, f32)) -> f64 {
         let mpos = DVec2::new(mpos.0 as Float, mpos.1 as Float);
-        let mut nearest_spring = None;
+        let mut nearest_spring_id = None;
         let mut nearest_node = None;
         if let AppMode::NodeSelected { node_id: None } = &self.app_mode {
             match (
@@ -395,10 +405,10 @@ impl SpringyApp {
             ) {
                 (None, None) => {}
                 (None, Some((node_ix, _))) => nearest_node = Some(node_ix),
-                (Some((spring, _)), None) => nearest_spring = Some(spring),
+                (Some((spring, _)), None) => nearest_spring_id = Some(spring),
                 (Some((spring, spring_dist)), Some((node_ix, node_dist))) => {
                     if (spring_dist + NEAREST_NODE_OVER_SPRING_OFFSET) < node_dist {
-                        nearest_spring = Some(spring);
+                        nearest_spring_id = Some(spring);
                     } else {
                         nearest_node = Some(node_ix);
                     }
@@ -418,68 +428,87 @@ impl SpringyApp {
             } else if node.is_stationary() {
                 node_color = RED;
             }
-            draw_circle(pos.x as f32, pos.y as f32, node.radius as f32, node_color);
+            if self.b_draw_instanced {
+                self.instanced_renderer
+                    .push_circle(pos, node.radius as f32, node_color);
+            } else {
+                draw_circle(pos.x as f32, pos.y as f32, node.radius as f32, node_color);
+            }
             if let AppMode::MultiSelection {
                 node_ids,
-                springs: _,
+                spring_ids: _,
             } = &self.app_mode
+                && node_ids.binary_search(&node.id).is_ok()
             {
-                if node_ids.binary_search(&node.id).is_ok() {
-                    let mut color = SKYBLUE;
-                    color.a = 0.75;
+                let mut color = SKYBLUE;
+                color.a = 0.75;
+                if self.b_draw_instanced {
+                    self.instanced_renderer
+                        .push_circle(pos, 2.0 * node.radius as f32, color);
+                } else {
                     draw_circle(pos.x as f32, pos.y as f32, 2.0 * node.radius as f32, color);
                 }
             }
             if let AppMode::GrabSelection {
                 node_ids_offsets,
-                springs: _,
+                spring_ids: _,
             } = &self.app_mode
-            {
-                if node_ids_offsets
+                && node_ids_offsets
                     .binary_search_by_key(&node.id, |id_offset| id_offset.0)
                     .is_ok()
-                {
-                    let mut color = SKYBLUE;
-                    color.a = 0.75;
+            {
+                let mut color = SKYBLUE;
+                color.a = 0.75;
+                if self.b_draw_instanced {
+                    self.instanced_renderer
+                        .push_circle(pos, 2.0 * node.radius as f32, color);
+                } else {
                     draw_circle(pos.x as f32, pos.y as f32, 2.0 * node.radius as f32, color);
                 }
             }
             let pos_a = node.position();
-            for attached in &node.attached {
-                if let Some(other_ix) = self.contraption.get_node_ix(attached.other_node_id) {
+            for attached_spring_id in self.contraption.get_attached_spring_ids(node.id) {
+                if let Some(spring_ix) = self.contraption.get_spring_ix(attached_spring_id) {
+                    let spring = self.contraption.get_spring(spring_ix);
+                    let other_ix = if spring.node_id_a == node.id {
+                        spring.node_id_b
+                    } else {
+                        spring.node_id_a
+                    };
                     let pos_b = self.contraption.get_node(other_ix).position();
-                    if let Some(spring) = attached.spring.upgrade() {
-                        let dist = pos_a.distance(pos_b);
-                        if let Ok(spring) = spring.read() {
-                            let max_len = spring.max_len;
-                            let stretch_factor = if dist < spring.resting_length {
-                                (spring.resting_length - dist) / spring.resting_length
-                            } else {
-                                (dist - spring.resting_length) / (max_len - spring.resting_length)
-                            };
-                            let color = colorous::RED_YELLOW_GREEN
-                                .eval_continuous((1.0 - stretch_factor).powi(4));
-                            let mut spring_color =
-                                macroquad::color::Color::from_rgba(color.r, color.g, color.b, 255);
-                            if (AppMode::SpringSelected {
-                                spring: attached.spring.clone(),
-                            }) == self.app_mode
-                            {
-                                spring_color = ORANGE;
-                            } else if let Some(nearest) = nearest_spring.as_ref()
-                                && nearest.as_ptr() == attached.spring.as_ptr()
-                            {
-                                spring_color = PURPLE;
-                            }
-                            draw_line(
-                                pos_a[0] as f32,
-                                pos_a[1] as f32,
-                                pos_b[0] as f32,
-                                pos_b[1] as f32,
-                                2.,
-                                spring_color,
-                            );
-                        }
+                    let dist = pos_a.distance(pos_b);
+                    let max_len = spring.max_len;
+                    let stretch_factor = if dist < spring.resting_length {
+                        (spring.resting_length - dist) / spring.resting_length
+                    } else {
+                        (dist - spring.resting_length) / (max_len - spring.resting_length)
+                    };
+                    let color =
+                        colorous::RED_YELLOW_GREEN.eval_continuous((1.0 - stretch_factor).powi(4));
+                    let mut spring_color =
+                        macroquad::color::Color::from_rgba(color.r, color.g, color.b, 255);
+                    if (AppMode::SpringSelected {
+                        spring_id: attached_spring_id,
+                    }) == self.app_mode
+                    {
+                        spring_color = ORANGE;
+                    } else if let Some(nearest) = nearest_spring_id
+                        && nearest == attached_spring_id
+                    {
+                        spring_color = PURPLE;
+                    }
+                    if self.b_draw_instanced {
+                        self.instanced_renderer
+                            .push_line(pos_a, pos_b, spring_color);
+                    } else {
+                        draw_line(
+                            pos_a[0] as f32,
+                            pos_a[1] as f32,
+                            pos_b[0] as f32,
+                            pos_b[1] as f32,
+                            2.,
+                            spring_color,
+                        );
                     }
                 }
             }
@@ -507,26 +536,49 @@ impl SpringyApp {
 
         // draw staging area
         for node in self.staging.nodes_iter() {
-            draw_circle(
-                node.position.x as f32,
-                node.position.y as f32,
-                node.radius as f32,
-                SKYBLUE,
-            );
-            for attached in node.attached.iter() {
-                if let Some(other_ix) = self.staging.get_node_ix(attached.other_node_id) {
-                    let other_pos = self.staging.get_node(other_ix).position;
-                    draw_line(
-                        node.position.x as f32,
-                        node.position.y as f32,
-                        other_pos.x as f32,
-                        other_pos.y as f32,
-                        3.0,
-                        SKYBLUE,
-                    );
+            if self.b_draw_instanced {
+                self.instanced_renderer
+                    .push_circle(node.position, node.radius as f32, SKYBLUE);
+            } else {
+                draw_circle(
+                    node.position.x as f32,
+                    node.position.y as f32,
+                    node.radius as f32,
+                    SKYBLUE,
+                );
+            }
+            for attached_spring_id in self.staging.get_attached_spring_ids(node.id) {
+                if let Some(spring_ix) = self.staging.get_spring_ix(attached_spring_id) {
+                    let spring = self.staging.get_spring(spring_ix);
+                    let other_node_id = if spring.node_id_a == node.id {
+                        spring.node_id_b
+                    } else {
+                        spring.node_id_a
+                    };
+                    if let Some(other_ix) = self.staging.get_node_ix(other_node_id) {
+                        let other_pos = self.staging.get_node(other_ix).position;
+                        if self.b_draw_instanced {
+                            self.instanced_renderer
+                                .push_line(node.position, other_pos, SKYBLUE);
+                        } else {
+                            draw_line(
+                                node.position.x as f32,
+                                node.position.y as f32,
+                                other_pos.x as f32,
+                                other_pos.y as f32,
+                                3.0,
+                                SKYBLUE,
+                            );
+                        }
+                    }
                 }
             }
         }
+        let start = get_time();
+        if self.b_draw_instanced {
+            self.instanced_renderer.draw();
+        }
+        get_time() - start
     }
 
     fn pull_to_mouse(&mut self, mpos: (f32, f32)) {
@@ -568,14 +620,19 @@ async fn main() {
     let mut mpos = (0.0, 0.0);
     let mut mouse_hover = false;
     let mut start = get_time();
-    let mut stop;
+    let mut stop = 0.0;
+    let mut elapsed = stop - start;
     let mut delta_t = 0.01;
     let mut compute_time = 0.;
+    let mut egui_time = 0.;
+    let mut draw_time = 0.;
     let mut step_elapsed;
     let mut paused: bool = false;
     loop {
         let width = screen_width() as Float;
         let height = screen_height() as Float;
+        app.instanced_renderer
+            .set_view(V2::new(width * 0.5, height * 0.5), 1.0);
         mpos_prev = mpos;
         mpos = app.grid.mouse_position();
         clear_background(BLACK);
@@ -585,9 +642,24 @@ async fn main() {
                 Window::new("Springy").show(ctx, |ui| {
                     ui.label(format!("Mouse: ({}, {})", mpos.0, mpos.1));
                     ui.label(format!("compute time: {:.2} ms", compute_time * 1000.));
+                    ui.label(format!("draw time: {:.2} ms", draw_time * 1000.));
+                    ui.label(format!("egui time: {:.2} ms", egui_time * 1000.));
+                    ui.label(format!("frame time: {:.2} ms", elapsed * 1000.));
+                    ui.label(format!(
+                        "ix == id => {}",
+                        app.contraption.check_indices_equal_ids()
+                    ));
+                    ui.label(format!(
+                        "id integrity => {}",
+                        app.contraption.check_id_integrity()
+                    ));
                     ui.label(format!("num nodes: {}", app.contraption.num_nodes()));
-                    ui.label(format!("num springs: {}", app.contraption.springs.len()));
+                    ui.label(format!("num springs: {}", app.contraption.num_springs()));
                     ui.label(format!("energy: {}", app.contraption.energy()));
+                    ui.label(format!(
+                        "rayon num threads: {}",
+                        rayon::current_num_threads()
+                    ));
                     if paused {
                         if ui.button("play").clicked() {
                             paused = false;
@@ -621,50 +693,54 @@ async fn main() {
         }
 
         // MultiSelection: store the mouse position where the selection starts
-        if !mouse_hover && is_mouse_button_pressed(MouseButton::Left) {
-            if let AppMode::MultiSelection { .. } = app.app_mode {
-                app.multi_selection_rect = Some((
-                    macroquad::math::Rect::new(mpos.0, mpos.1, 0.0, 0.0),
-                    Vec2::new(mpos.0, mpos.1),
-                ));
-            }
+        if !mouse_hover
+            && is_mouse_button_pressed(MouseButton::Left)
+            && let AppMode::MultiSelection { .. } = app.app_mode
+        {
+            app.multi_selection_rect = Some((
+                macroquad::math::Rect::new(mpos.0, mpos.1, 0.0, 0.0),
+                Vec2::new(mpos.0, mpos.1),
+            ));
         }
 
         // draw multiselection rect
-        if !mouse_hover && is_mouse_button_down(MouseButton::Left) {
-            if let AppMode::MultiSelection { .. } = app.app_mode {
-                if let Some((rect, start_pos)) = app.multi_selection_rect.as_mut() {
-                    let mut selection_rect_color = macroquad::color::SKYBLUE;
-                    selection_rect_color.a = 0.5;
-                    rect.w = (start_pos.x - mpos.0).abs();
-                    rect.h = (start_pos.y - mpos.1).abs();
-                    rect.x = start_pos.x.min(mpos.0);
-                    rect.y = start_pos.y.min(mpos.1);
-                    draw_rectangle(rect.x, rect.y, rect.w, rect.h, selection_rect_color);
-                }
-            }
+        if !mouse_hover
+            && is_mouse_button_down(MouseButton::Left)
+            && let AppMode::MultiSelection { .. } = app.app_mode
+            && let Some((rect, start_pos)) = app.multi_selection_rect.as_mut()
+        {
+            let mut selection_rect_color = macroquad::color::SKYBLUE;
+            selection_rect_color.a = 0.5;
+            rect.w = (start_pos.x - mpos.0).abs();
+            rect.h = (start_pos.y - mpos.1).abs();
+            rect.x = start_pos.x.min(mpos.0);
+            rect.y = start_pos.y.min(mpos.1);
+            draw_rectangle(rect.x, rect.y, rect.w, rect.h, selection_rect_color);
         }
 
         if !mouse_hover && is_mouse_button_released(MouseButton::Left) {
             app.contraption.apply_resting_length_factors();
             match &mut app.app_mode {
-                AppMode::NodeSelected { node_id: _ } | AppMode::SpringSelected { spring: _ } => {
+                AppMode::NodeSelected { node_id: _ } | AppMode::SpringSelected { spring_id: _ } => {
                     app.app_mode = app.select_nearest(mpos);
                 }
-                AppMode::MultiSelection { node_ids, springs } => {
+                AppMode::MultiSelection {
+                    node_ids,
+                    spring_ids,
+                } => {
                     if let Some((rect, _)) = app.multi_selection_rect {
                         if is_key_down(KeyCode::LeftControl) || is_key_down(KeyCode::RightControl) {
-                            (*node_ids, *springs) = app.contraption.multi_select(&rect, node_ids);
-                            springs.sort_by_key(|weak_spring| weak_spring.as_ptr());
-                            springs.dedup_by_key(|weak_spring| weak_spring.as_ptr());
+                            (*node_ids, *spring_ids) =
+                                app.contraption.multi_select(&rect, node_ids);
+                            spring_ids.sort_unstable();
+                            spring_ids.dedup();
                         } else {
-                            (*node_ids, *springs) = app.contraption.multi_select(&rect, &[]);
+                            (*node_ids, *spring_ids) = app.contraption.multi_select(&rect, &[]);
                         }
-                        if let Some(id) = node_ids.first() {
-                            if let Some(ix) = app.contraption.get_node_ix(*id) {
-                                app.node_config =
-                                    NodeConfig::from_node(&app.contraption.get_node(ix));
-                            }
+                        if let Some(id) = node_ids.first()
+                            && let Some(ix) = app.contraption.get_node_ix(*id)
+                        {
+                            app.node_config = NodeConfig::from_node(app.contraption.get_node(ix));
                         }
                     }
                 }
@@ -684,16 +760,16 @@ async fn main() {
                 }
                 AppMode::SpringEnd { node_a_id } => {
                     let mouse_position = P2::new(mpos.0 as Float, mpos.1 as Float);
-                    if let Some(ixa) = app.contraption.get_node_ix(*node_a_id) {
-                        if let Some((ixb, _)) = app.contraption.nearest_node_ix(&mouse_position) {
-                            app.contraption.create_spring_between(
-                                ixa,
-                                ixb,
-                                app.create_spring_constant,
-                                app.create_spring_dampening,
-                            );
-                            app.app_mode = AppMode::SpringStart;
-                        }
+                    if let Some(ixa) = app.contraption.get_node_ix(*node_a_id)
+                        && let Some((ixb, _)) = app.contraption.nearest_node_ix(&mouse_position)
+                    {
+                        app.contraption.create_spring_between(
+                            ixa,
+                            ixb,
+                            app.create_spring_constant,
+                            app.create_spring_dampening,
+                        );
+                        app.app_mode = AppMode::SpringStart;
                     }
                 }
                 AppMode::PlaceCircle { .. } => {
@@ -708,20 +784,20 @@ async fn main() {
         if !is_mouse_button_down(MouseButton::Left) {
             app.staging.clear();
         }
-        if !mouse_hover && !is_mouse_button_down(MouseButton::Left) {
-            if let AppMode::PlaceCircle {
+        if !mouse_hover
+            && !is_mouse_button_down(MouseButton::Left)
+            && let AppMode::PlaceCircle {
                 radius,
                 num_nodes,
                 node_config,
             } = app.app_mode
-            {
-                app.staging.add_circle(
-                    P2::new(mpos.0 as Float, mpos.1 as Float),
-                    radius,
-                    num_nodes,
-                    node_config,
-                );
-            }
+        {
+            app.staging.add_circle(
+                P2::new(mpos.0 as Float, mpos.1 as Float),
+                radius,
+                num_nodes,
+                node_config,
+            );
         }
 
         if is_key_pressed(KeyCode::P) {
@@ -742,7 +818,7 @@ async fn main() {
 
         // calculate delta_t
         stop = get_time();
-        let elapsed = stop - start;
+        elapsed = stop - start;
         start = stop;
         step_elapsed = 0.0;
 
@@ -775,13 +851,13 @@ async fn main() {
             app.pull_to_mouse(mpos);
         }
         if is_mouse_button_down(MouseButton::Left) && (app.app_mode == AppMode::CutSpring) {
-            if let Some((spring_ref, dist)) = app
+            if let Some((spring_id, dist)) = app
                 .contraption
                 .nearest_spring(&P2::new(mpos.0 as Float, mpos.1 as Float))
+                && dist < 2.0
+                && let Some(ix) = app.contraption.get_spring_ix(spring_id)
             {
-                if dist < 2.0 {
-                    app.contraption.delete_spring(spring_ref);
-                }
+                app.contraption.delete_spring(ix);
             }
 
             let ma = P2::new(mpos_prev.0 as Float, mpos_prev.1 as Float);
@@ -799,16 +875,16 @@ async fn main() {
                     node.position = pos;
                     node.velocity = V2::ZERO;
                 }
-            } else if let AppMode::GrabNode { node_id: None } = app.app_mode {
-                if let Some((ix, _)) = app.contraption.nearest_node_ix(&pos) {
-                    app.app_mode = AppMode::GrabNode {
-                        node_id: Some(app.contraption.get_node(ix).id),
-                    }
+            } else if let AppMode::GrabNode { node_id: None } = app.app_mode
+                && let Some((ix, _)) = app.contraption.nearest_node_ix(&pos)
+            {
+                app.app_mode = AppMode::GrabNode {
+                    node_id: Some(app.contraption.get_node(ix).id),
                 }
             }
             if let AppMode::GrabSelection {
                 node_ids_offsets,
-                springs: _,
+                spring_ids: _,
             } = &app.app_mode
             {
                 for (id, offset) in node_ids_offsets {
@@ -820,13 +896,15 @@ async fn main() {
                 }
             }
         }
-        app.draw_contraption(mpos);
+        draw_time = app.draw_contraption(mpos);
         // draw the grid if shift is pressed
         if is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift) {
             app.grid.draw();
         }
         // draw the frame
+        let start_egui = get_time();
         egui.draw();
+        egui_time = get_time() - start_egui;
         next_frame().await
     }
 }
@@ -963,13 +1041,13 @@ impl MiddleMouse {
 pub enum AppMode {
     MultiSelection {
         node_ids: Vec<NodeId>,
-        springs: Vec<Weak<RwLock<Spring>>>,
+        spring_ids: Vec<SpringId>,
     },
     NodeSelected {
         node_id: Option<NodeId>,
     },
     SpringSelected {
-        spring: Weak<RwLock<Spring>>,
+        spring_id: SpringId,
     },
     PlaceNode,
     SpringStart,
@@ -987,7 +1065,7 @@ pub enum AppMode {
     },
     GrabSelection {
         node_ids_offsets: Vec<(NodeId, P2)>,
-        springs: Vec<Weak<RwLock<Spring>>>,
+        spring_ids: Vec<SpringId>,
     },
 }
 
@@ -1006,9 +1084,10 @@ impl PartialEq for AppMode {
                 },
             ) => node_a_id == node_b_id,
             (AppMode::SpringStart, AppMode::SpringStart) => true,
-            (AppMode::SpringSelected { spring: sa }, AppMode::SpringSelected { spring: sb }) => {
-                sa.ptr_eq(sb)
-            }
+            (
+                AppMode::SpringSelected { spring_id: sa },
+                AppMode::SpringSelected { spring_id: sb },
+            ) => sa == sb,
             (AppMode::CutSpring, AppMode::CutSpring) => true,
             (AppMode::GrabNode { .. }, AppMode::GrabNode { .. }) => true,
             (AppMode::GrabSelection { .. }, AppMode::GrabSelection { .. }) => true,

@@ -1,30 +1,35 @@
 use macroquad::math::Rect;
 use rayon::prelude::*;
-use std::{
-    cmp::Ordering,
-    collections::HashMap,
-    sync::{Arc, RwLock, Weak},
-};
+use std::{cmp::Ordering, collections::HashMap};
 
 use crate::{
     Float, P2, V2,
     configs::{GridConfig, GridType, NodeConfig},
-    node::{Attached, Node, NodeId},
-    spring::Spring,
+    node::{Node, NodeId},
+    spring::{Spring, SpringId},
 };
 
+// if the structure of the contraption is changed meaning adding/deleting a node/spring
+// node_map, springs, spring_map and node_to_springs must be updated accordingly
+// also next_node_id and next_spring_id need to be adjusted if a node/spring is added or when merging
+// with other contraptions
+// essentially the first 7 variables of the struct must be kept in sync
 #[derive(Debug, Clone)]
 pub struct Contraption {
     nodes: Vec<Node>,
     node_map: HashMap<NodeId, usize>,
     next_node_id: NodeId,
-    pub springs: Vec<Arc<RwLock<Spring>>>,
+    springs: Vec<Spring>,
+    spring_map: HashMap<SpringId, usize>,
+    next_spring_id: SpringId,
+    node_to_springs: HashMap<NodeId, Vec<SpringId>>,
     // intermediate values for Runge Kutta
     // stored in the struct to avoid reallocations
     kps: [Vec<P2>; 4],
     kvs: [Vec<V2>; 4],
     kaccs: [Vec<V2>; 4],
     pub g: V2,
+    thread_local_accs: Vec<Vec<V2>>,
 }
 
 impl Default for Contraption {
@@ -35,14 +40,22 @@ impl Default for Contraption {
 
 impl Contraption {
     pub fn new() -> Contraption {
+        let mut thread_local_accs = Vec::new();
+        for _ in 0..rayon::current_num_threads() {
+            thread_local_accs.push(Vec::new());
+        }
         Contraption {
             nodes: Vec::new(),
             node_map: HashMap::new(),
             next_node_id: 0,
             springs: Vec::new(),
+            spring_map: HashMap::new(),
+            next_spring_id: 0,
+            node_to_springs: HashMap::new(),
             kps: [const { Vec::new() }; 4],
             kvs: [const { Vec::new() }; 4],
             kaccs: [const { Vec::new() }; 4],
+            thread_local_accs,
             g: V2::new(0., 0.),
         }
     }
@@ -63,10 +76,14 @@ impl Contraption {
                 self.kvs[n + 1][i] = node.velocity + factor * delta_t * self.kaccs[n][i];
             }
 
-            for (i, _) in self.nodes.iter().enumerate() {
-                self.kaccs[n + 1][i] =
-                    self.g + self.acceleration(i, &self.kps[n + 1], &self.kvs[n + 1]);
-            }
+            Contraption::acceleration_phase(
+                &self.node_map,
+                &self.springs,
+                &self.nodes,
+                &self.kps[n + 1],
+                &self.kvs[n + 1],
+                &mut self.kaccs[n + 1],
+            );
         }
 
         // updating nodes
@@ -95,10 +112,19 @@ impl Contraption {
             self.kvs[0][i] = self.nodes[i].velocity;
         }
 
-        // calculate acceleration
+        // use the positions and velocities of self.nodes which where collected in the previous loop
+        self.kaccs[0].fill(V2::ZERO);
+        Contraption::acceleration_phase(
+            &self.node_map,
+            &self.springs,
+            &self.nodes,
+            &self.kps[0],
+            &self.kvs[0],
+            &mut self.kaccs[0],
+        );
+        // transfer calculated accelerations and add gravity
         for i in 0..self.nodes.len() {
-            // use the positions and velocities of self.nodes which where collected in the previous loop
-            self.nodes[i].acceleration = self.g + self.acceleration(i, &self.kps[0], &self.kvs[0]);
+            self.nodes[i].acceleration = self.g + self.kaccs[0][i];
         }
     }
 
@@ -132,19 +158,15 @@ impl Contraption {
                     *kvnp1 = node.velocity + factor * delta_t * *kaccn;
                 });
 
-            (&self.nodes, kaccsnp1)
-                .into_par_iter()
-                .enumerate()
-                .for_each(|(i, (node, kaccsnp1))| {
-                    *kaccsnp1 = self.g
-                        + Self::acceleration_par(
-                            &self.node_map,
-                            i,
-                            node,
-                            &self.kps[n + 1],
-                            &self.kvs[n + 1],
-                        );
-                });
+            Contraption::acceleration_phase_rayon(
+                &self.node_map,
+                &self.springs,
+                &self.nodes,
+                &self.kps[n + 1],
+                &self.kvs[n + 1],
+                kaccsnp1,
+                &mut self.thread_local_accs,
+            );
         }
 
         // updating nodes
@@ -185,50 +207,89 @@ impl Contraption {
                 },
             );
 
-        // calculate acceleration
+        // use the positions and velocities of self.nodes which where collected in the previous loop
+        Contraption::acceleration_phase_rayon(
+            &self.node_map,
+            &self.springs,
+            &self.nodes,
+            &self.kps[0],
+            &self.kvs[0],
+            &mut self.kaccs[0],
+            &mut self.thread_local_accs,
+        );
+        // transfer calculated accelerations and add gravity
         for i in 0..self.nodes.len() {
-            // use the positions and velocities of self.nodes which where collected in the previous loop
-            self.nodes[i].acceleration = self.g + self.acceleration(i, &self.kps[0], &self.kvs[0]);
+            self.nodes[i].acceleration = self.g + self.kaccs[0][i];
         }
     }
 
-    pub fn acceleration(&self, node_ix: usize, kps: &[P2], kvs: &[V2]) -> V2 {
-        let mut forces = V2::ZERO;
-        let node = &self.nodes[node_ix];
-        for attached in node.attached.iter() {
-            if let Some(spring) = attached.spring.upgrade()
-                && let Some(other_ix) = self.get_node_ix(attached.other_node_id)
-            {
-                let dir = kps[other_ix] - kps[node_ix];
-                let vdiff = kvs[other_ix] - kvs[node_ix];
-                if let Ok(spring) = spring.read() {
-                    forces += spring.force(&dir, &vdiff);
-                }
-            }
-        }
-        forces / node.weight
-    }
-
-    pub fn acceleration_par(
+    /// calculate all accelerations in parallel
+    /// needs positions and velocities and a target buffer to write to
+    pub fn acceleration_phase(
         map: &HashMap<NodeId, usize>,
-        node_ix: usize,
-        node: &Node,
+        springs: &[Spring],
+        nodes: &[Node],
         kps: &[P2],
         kvs: &[V2],
-    ) -> V2 {
-        let mut forces = V2::ZERO;
-        for attached in node.attached.iter() {
-            if let Some(spring) = attached.spring.upgrade()
-                && let Some(&other_ix) = map.get(&attached.other_node_id)
-            {
-                let dir = kps[other_ix] - kps[node_ix];
-                let vdiff = kvs[other_ix] - kvs[node_ix];
-                if let Ok(spring) = spring.read() {
-                    forces += spring.force(&dir, &vdiff);
+        acc_target_buffer: &mut [V2],
+    ) {
+        for spring in springs {
+            let ixa = map[&spring.node_id_a];
+            let ixb = map[&spring.node_id_b];
+            let dir = kps[ixb] - kps[ixa];
+            let vdiff = kvs[ixb] - kvs[ixa];
+            let force = spring.force(&dir, &vdiff);
+            // rk4_init initializes n + 1 accelerations to 0 so adding onto them is fine
+            acc_target_buffer[ixa] += force / nodes[ixa].weight;
+            acc_target_buffer[ixb] += -force / nodes[ixb].weight;
+        }
+    }
+
+    /// calculate all accelerations in parallel
+    /// needs positions and velocities and a target buffer to write to
+    pub fn acceleration_phase_rayon(
+        map: &HashMap<NodeId, usize>,
+        springs: &[Spring],
+        nodes: &[Node],
+        kps: &[P2],
+        kvs: &[V2],
+        acc_target_buffer: &mut [V2],
+        thread_local_accs: &mut Vec<Vec<V2>>,
+    ) {
+        // zero the thread_local_accs buffer
+        thread_local_accs
+            .par_iter_mut()
+            .for_each(|tla| tla.fill(V2::ZERO));
+        acc_target_buffer
+            .par_iter_mut()
+            .for_each(|acc| *acc = V2::ZERO);
+        let num_threads = thread_local_accs.len();
+        // do not let chunk_size get zero
+        let chunk_size = if springs.len() < num_threads {
+            springs.len().max(1)
+        } else {
+            springs.len().div_ceil(num_threads)
+        };
+        springs
+            .par_chunks(chunk_size)
+            .zip(&mut *thread_local_accs)
+            .for_each(|(springs, tl_accs)| {
+                for spring in springs {
+                    let ixa = map[&spring.node_id_a];
+                    let ixb = map[&spring.node_id_b];
+                    let dir = kps[ixb] - kps[ixa];
+                    let vdiff = kvs[ixb] - kvs[ixa];
+                    let force = spring.force(&dir, &vdiff);
+                    // rk4_init initializes n + 1 accelerations to 0 so adding onto them is fine
+                    tl_accs[ixa] += force / nodes[ixa].weight;
+                    tl_accs[ixb] += -force / nodes[ixb].weight;
                 }
+            });
+        for (ix, acc) in acc_target_buffer.iter_mut().enumerate() {
+            for tl_acc in thread_local_accs.iter() {
+                *acc += tl_acc[ix];
             }
         }
-        forces / node.weight
     }
 
     // initialize kps, kvs, kaccs
@@ -249,21 +310,30 @@ impl Contraption {
                 accs.push(V2::ZERO);
             }
         }
+        let num_threads = rayon::current_num_threads();
+        for thread_ix in 0..num_threads {
+            while self.thread_local_accs[thread_ix].len() < self.nodes.len() {
+                self.thread_local_accs[thread_ix].push(V2::ZERO);
+            }
+        }
         // fill in initial values
         for (i, node) in self.nodes.iter().enumerate() {
             self.kps[0][i] = node.position();
             self.kvs[0][i] = node.velocity;
             self.kaccs[0][i] = node.acceleration;
         }
+        self.kaccs[1].fill(V2::ZERO);
+        self.kaccs[2].fill(V2::ZERO);
+        self.kaccs[3].fill(V2::ZERO);
     }
 
     pub fn step_motors(&mut self, delta_t: Float) {
         for node in self.nodes.iter_mut() {
-            if node.is_stationary() {
-                if let Some(mut motor) = node.get_motor() {
-                    motor.step(delta_t);
-                    node.set_motor(Some(motor));
-                }
+            if node.is_stationary()
+                && let Some(mut motor) = node.get_motor()
+            {
+                motor.step(delta_t);
+                node.set_motor(Some(motor));
             }
         }
     }
@@ -275,15 +345,50 @@ impl Contraption {
         self.next_node_id += 1;
     }
 
+    /// NOTE: node_id's must be valid
+    pub fn push_spring(&mut self, mut spring: Spring) {
+        spring.id = self.next_spring_id;
+        self.spring_map.insert(spring.id, self.springs.len());
+
+        // insert the spring into self.node_to_springs
+        if let Some(connected_spring_ids) = self.node_to_springs.get_mut(&spring.node_id_a) {
+            connected_spring_ids.push(spring.id);
+        } else {
+            self.node_to_springs
+                .insert(spring.node_id_a, vec![spring.id]);
+        }
+        if let Some(connected_spring_ids) = self.node_to_springs.get_mut(&spring.node_id_b) {
+            connected_spring_ids.push(spring.id);
+        } else {
+            self.node_to_springs
+                .insert(spring.node_id_b, vec![spring.id]);
+        }
+
+        self.springs.push(spring);
+        self.next_spring_id += 1;
+    }
+
     #[inline(always)]
     pub fn get_node_ix(&self, id: NodeId) -> Option<usize> {
         self.node_map.get(&id).copied()
+    }
+
+    #[inline(always)]
+    pub fn get_spring_ix(&self, id: SpringId) -> Option<usize> {
+        self.spring_map.get(&id).copied()
     }
 
     pub fn rehash_nodes(&mut self) {
         self.node_map.clear();
         for (ix, node) in self.nodes.iter().enumerate() {
             self.node_map.insert(node.id, ix);
+        }
+    }
+
+    pub fn rehash_springs(&mut self) {
+        self.node_map.clear();
+        for (ix, spring) in self.springs.iter().enumerate() {
+            self.spring_map.insert(spring.id, ix);
         }
     }
 
@@ -297,6 +402,7 @@ impl Contraption {
     //     self.get_node_ix_min_max(id, min_ix, max_ix)
     // }
 
+    /// manual binary search for a NodeId between two indices
     fn get_node_ix_min_max(&self, id: NodeId, min_ix: usize, max_ix: usize) -> Option<usize> {
         if min_ix == max_ix {
             if self.nodes[min_ix].id == id {
@@ -325,17 +431,19 @@ impl Contraption {
         let ixb = self.get_node_ix(node_id_b);
         if let (Some(ixa), Some(ixb)) = (ixa, ixb) {
             let node_distance = self.nodes[ixa].position.distance(self.nodes[ixb].position);
-            self.create_spring(node_distance, spring_constant, dampening, pretension_force);
-            let aa = Attached {
-                spring: Arc::downgrade(self.springs.last().unwrap()),
-                other_node_id: self.nodes[ixb].id,
+            let spring = Spring {
+                id: self.next_spring_id,
+                spring_constant,
+                resting_length: node_distance,
+                resting_length_factor: 1.0,
+                pretension_force,
+                damping_factor: dampening,
+                min_len: 0.2 * node_distance,
+                max_len: 5.0 * node_distance,
+                node_id_a,
+                node_id_b,
             };
-            self.nodes[ixa].attached.push(aa);
-            let ab = Attached {
-                spring: Arc::downgrade(self.springs.last().unwrap()),
-                other_node_id: self.nodes[ixa].id,
-            };
-            self.nodes[ixb].attached.push(ab);
+            self.push_spring(spring);
         }
     }
 
@@ -345,21 +453,32 @@ impl Contraption {
     }
 
     pub fn spring_exists_between(&self, node_id_a: NodeId, node_id_b: NodeId) -> bool {
-        if let Some(ixa) = self.get_node_ix(node_id_a) {
-            for attached in self.nodes[ixa].attached.iter() {
-                if attached.other_node_id == node_id_b {
-                    return true;
+        // first both nodes must exist in self.node_to_springs
+        if let Some(springs_a) = self.node_to_springs.get(&node_id_a)
+            && let Some(springs_b) = self.node_to_springs.get(&node_id_b)
+        {
+            if springs_a.is_empty() || springs_b.is_empty() {
+                return false;
+            }
+            // both arrays are sorted so step in 'sync'
+            let mut ixsa = 0;
+            let mut ixsb = 0;
+            loop {
+                if ixsa >= springs_a.len() {
+                    return false;
+                }
+                if ixsb >= springs_b.len() {
+                    return false;
+                }
+                match springs_a[ixsa].cmp(&springs_b[ixsb]) {
+                    Ordering::Less => ixsa += 1,
+                    Ordering::Equal => return true,
+                    Ordering::Greater => ixsb += 1,
                 }
             }
+        } else {
+            false
         }
-        if let Some(ixb) = self.get_node_ix(node_id_b) {
-            for attached in self.nodes[ixb].attached.iter() {
-                if attached.other_node_id == node_id_a {
-                    return true;
-                }
-            }
-        }
-        false
     }
 
     pub fn insert_spring_on_indices(
@@ -371,22 +490,21 @@ impl Contraption {
         spring_pretension_force: Float,
     ) {
         let node_distance = self.nodes[ixa].position.distance(self.nodes[ixb].position);
-        self.create_spring(
-            node_distance,
+        let node_id_a = self.nodes[ixa].id;
+        let node_id_b = self.nodes[ixb].id;
+        let spring = Spring {
+            id: self.next_spring_id,
             spring_constant,
-            spring_dampening,
-            spring_pretension_force,
-        );
-        let ab = Attached {
-            spring: Arc::downgrade(self.springs.last().unwrap()),
-            other_node_id: self.nodes[ixb].id,
+            resting_length: node_distance,
+            resting_length_factor: 1.0,
+            pretension_force: spring_pretension_force,
+            damping_factor: spring_dampening,
+            min_len: 0.2 * node_distance,
+            max_len: 5.0 * node_distance,
+            node_id_a,
+            node_id_b,
         };
-        self.nodes[ixa].attached.push(ab);
-        let ba = Attached {
-            spring: Arc::downgrade(self.springs.last().unwrap()),
-            other_node_id: self.nodes[ixa].id,
-        };
-        self.nodes[ixb].attached.push(ba);
+        self.push_spring(spring);
     }
 
     pub fn fully_connect(
@@ -399,30 +517,24 @@ impl Contraption {
     ) {
         for ida in node_ids.iter().copied() {
             for idb in node_ids.iter().copied() {
-                if let Some(ixa) = self.get_node_ix(ida) {
-                    if let Some(ixb) = self.get_node_ix(idb) {
-                        let node_dist =
-                            (self.nodes[ixa].position() - self.nodes[ixb].position()).length();
-                        let distance_constraint =
-                            (min_distance..=max_distance).contains(&node_dist);
-                        if ida != idb
-                            && !self.spring_exists_between(ida, idb)
-                            && distance_constraint
-                        {
-                            self.insert_spring(ida, idb, spring_constant, dampening, 0.0);
-                        }
+                if let Some(ixa) = self.get_node_ix(ida)
+                    && let Some(ixb) = self.get_node_ix(idb)
+                {
+                    let node_dist =
+                        (self.nodes[ixa].position() - self.nodes[ixb].position()).length();
+                    let distance_constraint = (min_distance..=max_distance).contains(&node_dist);
+                    if ida != idb && !self.spring_exists_between(ida, idb) && distance_constraint {
+                        self.insert_spring(ida, idb, spring_constant, dampening, 0.0);
                     }
                 }
             }
         }
     }
 
-    pub fn apply_resting_length_factors(&self) {
-        for spring in self.springs.iter() {
-            if let Ok(mut spring_write) = spring.write() {
-                spring_write.apply_resting_length_factor();
-            }
-        }
+    pub fn apply_resting_length_factors(&mut self) {
+        self.springs.iter_mut().for_each(|spring| {
+            spring.apply_resting_length_factor();
+        });
     }
 
     pub fn add_grid(
@@ -650,11 +762,32 @@ impl Contraption {
     }
 
     pub fn merge(&mut self, other: &mut Contraption) {
-        for node in other.nodes.drain(..) {
-            self.push_node(node);
-        }
-        for spring in other.springs.drain(..) {
-            self.springs.push(spring);
+        // shift NodeId's of other up into a range which is not occupied by selfs NodeId's
+        // and do the same for SpringId's
+        if let Some(first_node_of_other) = other.nodes.first() {
+            // update self.nodes
+            let adjust_node_id =
+                self.next_node_id.max(first_node_of_other.id) - first_node_of_other.id;
+            for mut node in other.nodes.drain(..) {
+                // we can not use self.push_node(...) since springs rely on adjust_node_id to be constant
+                // so we insert the node and do the bookkeeping manually
+                node.id += adjust_node_id;
+                self.next_node_id = node.id + 1;
+                self.node_map.insert(node.id, self.nodes.len());
+                self.nodes.push(node);
+            }
+
+            // update self.springs
+            for mut spring in other.springs.drain(..) {
+                // adjust id's
+                spring.node_id_a += adjust_node_id;
+                spring.node_id_b += adjust_node_id;
+
+                // do all the needed updates
+                // push_spring does the update to spring.id and next_spring_id so we do not need
+                // to care about that here
+                self.push_spring(spring);
+            }
         }
     }
 
@@ -679,82 +812,78 @@ impl Contraption {
         res
     }
 
-    /// returns a reference to the spring and its distance
-    pub fn nearest_spring(&self, to: &P2) -> Option<(Weak<RwLock<Spring>>, Float)> {
+    /// returns the spring's id and its distance
+    pub fn nearest_spring(&self, to: &P2) -> Option<(SpringId, Float)> {
         let mut res = None;
-        for node in self.nodes.iter() {
-            for attached in node.attached.iter() {
-                if let Some(ix) = self.get_node_ix(attached.other_node_id) {
-                    let other_node = &self.nodes[ix];
-                    let dirab = other_node.position() - node.position();
-                    if dirab.length() <= f64::EPSILON {
-                        continue;
+        for spring in self.springs.iter() {
+            let ixa = self.node_map[&spring.node_id_a];
+            let ixb = self.node_map[&spring.node_id_b];
+            let dirab = self.nodes[ixa].position() - self.nodes[ixb].position();
+            if dirab.length() <= f64::EPSILON {
+                continue;
+            }
+            let dirba = -dirab;
+            // if to is closer to the spring than any of its nodes
+            let a = to - self.nodes[ixa].position();
+            let b = to - self.nodes[ixb].position();
+            if (dirab.dot(a) > 0.0) && (dirba.dot(b) > 0.0) {
+                // calculate the distance
+                let dirabn = dirab.normalize();
+                let dist = (a.length_squared() - dirabn.dot(a).powi(2)).sqrt();
+                if let Some((_, current_dist)) = res {
+                    if dist < current_dist {
+                        res = Some((spring.id, dist));
                     }
-                    let dirba = -dirab;
-                    // if to is closer to the spring than any of its nodes
-                    let a = to - node.position();
-                    let b = to - other_node.position();
-                    if (dirab.dot(a) > 0.0) && (dirba.dot(b) > 0.0) {
-                        // calculate the distance
-                        let dirabn = dirab.normalize();
-                        let dist = (a.length_squared() - dirabn.dot(a).powi(2)).sqrt();
-                        if let Some((_, current_dist)) = res {
-                            if dist < current_dist {
-                                res = Some((attached.spring.clone(), dist));
-                            }
-                        } else {
-                            res = Some((attached.spring.clone(), dist));
-                        }
-                    }
+                } else {
+                    res = Some((spring.id, dist));
                 }
             }
         }
         res
     }
 
+    /// previous_nodes are previously selected nodes which should be part of the
+    /// new selection as well
     pub fn multi_select(
         &self,
         rect: &Rect,
         previous_nodes: &[NodeId],
-    ) -> (Vec<NodeId>, Vec<Weak<RwLock<Spring>>>) {
+    ) -> (Vec<NodeId>, Vec<SpringId>) {
         let mut node_ids = Vec::from_iter(previous_nodes.iter().copied());
-        let mut node_indices = Vec::new();
-        for id in node_ids.iter() {
-            if let Some(ix) = self.get_node_ix(*id) {
-                node_indices.push(ix);
-            }
-        }
-        for (ix, node) in self.nodes.iter().enumerate() {
+        // collect every node
+        for node in &self.nodes {
             let pos =
                 macroquad::math::Vec2::new(node.position().x as f32, node.position().y as f32);
             if rect.contains(pos) {
                 node_ids.push(node.id);
-                node_indices.push(ix);
             }
         }
         node_ids.sort();
         node_ids.dedup();
-        node_indices.sort();
-        node_indices.dedup();
-        let mut springs = Vec::new();
-        for node_ix in node_indices.iter() {
-            for attached in self.nodes[*node_ix].attached.iter() {
-                if node_ids.binary_search(&attached.other_node_id).is_ok() {
-                    springs.push(attached.spring.clone());
-                }
+        let mut spring_ids = Vec::new();
+        for spring in &self.springs {
+            if node_ids.binary_search(&spring.node_id_a).is_ok()
+                && node_ids.binary_search(&spring.node_id_b).is_ok()
+            {
+                spring_ids.push(spring.id);
             }
         }
-        (node_ids, springs)
+        spring_ids.sort();
+        spring_ids.dedup();
+        (node_ids, spring_ids)
     }
 
     pub fn create_spring(
         &mut self,
+        node_id_a: NodeId,
+        node_id_b: NodeId,
         resting_length: Float,
         spring_constant: Float,
         damping_factor: Float,
         pretension_force: Float,
     ) {
         let spring = Spring {
+            id: self.next_spring_id,
             spring_constant,
             resting_length,
             resting_length_factor: 1.0,
@@ -762,8 +891,10 @@ impl Contraption {
             damping_factor,
             min_len: 0.2 * resting_length,
             max_len: 5.0 * resting_length,
+            node_id_a,
+            node_id_b,
         };
-        self.springs.push(Arc::new(RwLock::new(spring)));
+        self.push_spring(spring);
     }
 
     pub fn create_spring_between(
@@ -775,6 +906,7 @@ impl Contraption {
     ) {
         let resting_length = self.nodes[ixa].position.distance(self.nodes[ixb].position);
         let spring = Spring {
+            id: self.next_spring_id,
             spring_constant,
             resting_length,
             resting_length_factor: 1.0,
@@ -782,114 +914,196 @@ impl Contraption {
             damping_factor,
             min_len: 0.25 * resting_length,
             max_len: 4.0 * resting_length,
+            node_id_a: self.nodes[ixa].id,
+            node_id_b: self.nodes[ixb].id,
         };
-        let spring_ref = Arc::new(RwLock::new(spring));
-        self.springs.push(spring_ref.clone());
-        let ata = Attached {
-            spring: Arc::downgrade(&spring_ref),
-            other_node_id: self.nodes[ixb].id,
-        };
-        self.nodes[ixa].attached.push(ata);
-        let atb = Attached {
-            spring: Arc::downgrade(&spring_ref),
-            other_node_id: self.nodes[ixa].id,
-        };
-        self.nodes[ixb].attached.push(atb);
+        self.push_spring(spring);
     }
 
     pub fn spring_break(&mut self) {
-        let mut delete_indices = Vec::new();
-        for (node_ix, node) in self.nodes.iter().enumerate() {
-            for (attached_ix, attached) in node.attached.iter().enumerate() {
-                if attached.is_destruct(&self.nodes, node.position()) {
-                    delete_indices.push((node_ix, attached_ix));
-                }
+        let mut delete_spring_indices = Vec::new();
+        for (ix, spring) in self.springs.iter().enumerate() {
+            if spring.is_destruct(&self.nodes, &self.node_map) {
+                delete_spring_indices.push(ix);
             }
         }
-        // iterate in reverse, so the indices remain valid after one or more Attached's have been
-        // removed
-        for (node_ix, attached_ix) in delete_indices.iter().rev().copied() {
-            self.nodes[node_ix].attached.remove(attached_ix);
+        // delete indices in reverse order since delete_springs swap remove could mess with higher indices
+        for ix in delete_spring_indices.iter().rev() {
+            self.delete_spring(*ix);
         }
     }
 
+    pub fn get_attached_spring_ids(&self, node_id: NodeId) -> Vec<SpringId> {
+        self.node_to_springs
+            .get(&node_id)
+            .unwrap_or(&vec![])
+            .clone()
+    }
+
+    /// remove springs between ma and mb
     /// ma : previous mouse position, mb : current mouse position
     pub fn cut_springs(&mut self, ma: P2, mb: P2) {
-        let mut springs_to_cut = Vec::new();
-        for node in self.nodes.iter() {
-            let nap = node.position;
-            for attached in node.attached.iter() {
-                if let Some(ixb) = self.get_node_ix(attached.other_node_id) {
-                    let nbp = self.nodes[ixb].position;
-                    let va = ma - nap;
-                    let vb = mb - nap;
-                    let vc = nbp - ma;
-                    let vs = nbp - nap;
-                    let vm = mb - ma;
-                    if (vs.perp_dot(va) * vs.perp_dot(vb)) <= 0.0
-                        && (vm.perp_dot(va) * vm.perp_dot(vc)) >= 0.0
-                    {
-                        springs_to_cut.push(attached.spring.clone());
-                    }
-                }
+        let mut delete_spring_indices = Vec::new();
+        for (ix, spring) in self.springs.iter().enumerate() {
+            if spring.crosses(&self.nodes, &self.node_map, ma, mb) {
+                delete_spring_indices.push(ix);
             }
         }
-        springs_to_cut.sort_unstable_by_key(|s| s.as_ptr());
-        springs_to_cut.dedup_by_key(|s| s.as_ptr());
-        self.springs.retain(|spring_rc| {
-            springs_to_cut
-                .binary_search_by_key(&Arc::downgrade(spring_rc).as_ptr(), |weak| weak.as_ptr())
-                .is_err()
-        });
+        // delete indices in reverse order since delete_springs swap remove could mess with higher indices
+        for ix in delete_spring_indices.iter().rev() {
+            self.delete_spring(*ix);
+        }
     }
 
     pub fn delete_node(&mut self, node_id: NodeId) {
         if let Some(ix) = self.get_node_ix(node_id) {
-            self.nodes.remove(ix);
+            // first remove all attached springs
+            for spring_id in self.node_to_springs[&node_id].clone().iter() {
+                self.delete_spring(self.spring_map[spring_id]);
+            }
+            self.nodes.swap_remove(ix);
+
+            self.reassign_node_id(self.nodes[ix].id, node_id, ix);
         }
     }
 
-    pub fn delete_spring(&mut self, spring_rc: Weak<RwLock<Spring>>) {
-        let mut remove_ix = None;
-        for (ix, spring) in self.springs.iter().enumerate() {
-            let downgraded = Arc::downgrade(spring);
-            if Weak::ptr_eq(&downgraded, &spring_rc) {
-                remove_ix = Some(ix);
-                break;
+    fn reassign_node_id(&mut self, from: NodeId, to: NodeId, node_ix: usize) {
+        self.nodes[node_ix].id = to;
+        if let Some(spring_ids) = self.node_to_springs.remove(&from) {
+            for spring_id in spring_ids.iter() {
+                if let Some(spring) = self.springs.get_mut(self.spring_map[spring_id]) {
+                    if spring.node_id_a == from {
+                        spring.node_id_a = to;
+                    }
+                    if spring.node_id_b == from {
+                        spring.node_id_b = to;
+                    }
+                }
             }
+            self.node_to_springs.insert(to, spring_ids);
         }
-        if let Some(ix) = remove_ix {
-            self.springs.remove(ix);
+        if let Some(last_node) = self.nodes.last() {
+            self.next_node_id = last_node.id + 1;
         }
+    }
+
+    pub fn delete_spring(&mut self, spring_ix: usize) {
+        let is_last_elem = spring_ix == (self.springs.len() - 1);
+        let removed = self.springs.swap_remove(spring_ix);
+        // remove deleted SpringId from node_to_springs
+        if let Ok(node_to_spring_ix) =
+            self.node_to_springs[&removed.node_id_a].binary_search(&removed.id)
+            && let Some(spring_ids) = self.node_to_springs.get_mut(&removed.node_id_a)
+        {
+            spring_ids.remove(node_to_spring_ix);
+        }
+        if let Ok(node_to_spring_ix) =
+            self.node_to_springs[&removed.node_id_b].binary_search(&removed.id)
+            && let Some(spring_ids) = self.node_to_springs.get_mut(&removed.node_id_b)
+        {
+            spring_ids.remove(node_to_spring_ix);
+        }
+        if is_last_elem {
+            return;
+        }
+
+        self.reassign_spring_id(self.springs[spring_ix].id, removed.id, spring_ix);
+    }
+
+    /// preserve order of SpringId's in self.springs
+    /// this assumes that the SpringId 'to' is not yet taken
+    /// this also assumes that after reassigning the order of SpringId's in self.springs will be
+    /// sorted after the operation as it does not sort self.springs
+    fn reassign_spring_id(&mut self, from: SpringId, to: SpringId, spring_ix: usize) {
+        let node_id_a = self.springs[spring_ix].node_id_a;
+        if let Ok(node_to_spring_ix) = self.node_to_springs[&node_id_a].binary_search(&from)
+            && let Some(spring_ids) = self.node_to_springs.get_mut(&node_id_a)
+        {
+            spring_ids[node_to_spring_ix] = to;
+            spring_ids.sort_unstable();
+        }
+        let node_id_b = self.springs[spring_ix].node_id_b;
+        if let Ok(node_to_spring_ix) = self.node_to_springs[&node_id_b].binary_search(&from)
+            && let Some(spring_ids) = self.node_to_springs.get_mut(&node_id_b)
+        {
+            spring_ids[node_to_spring_ix] = to;
+            spring_ids.sort_unstable();
+        }
+        self.springs[spring_ix].id = to;
+        self.next_spring_id = self.springs.last().map_or(0, |spring| spring.id + 1);
     }
 
     pub fn clear(&mut self) {
         self.springs.clear();
         self.nodes.clear();
         self.node_map.clear();
+        self.spring_map.clear();
+        self.node_to_springs.clear();
+        self.next_node_id = 0;
+        self.next_spring_id = 0;
     }
+
+    // non mutating functions
 
     pub fn energy(&self) -> Float {
         let mut energy = 0.0;
+        // nodes kinetic energy
         for node in &self.nodes {
             energy += 0.5 * node.weight * node.velocity.length_squared();
-            for attached in &node.attached {
-                if let Some(spring) = attached.spring.upgrade() {
-                    if let Some(other_node_ix) = self.get_node_ix(attached.other_node_id) {
-                        let distance = node
-                            .position()
-                            .distance(self.nodes[other_node_ix].position());
-                        if let Ok(spring) = spring.read() {
-                            energy += 0.25
-                                * (spring.resting_length - distance).powi(2)
-                                * spring.spring_constant;
-                        }
-                    }
-                }
-            }
+        }
+        // springs potential energy
+        for spring in &self.springs {
+            let ixa = self.node_map[&spring.node_id_a];
+            let ixb = self.node_map[&spring.node_id_b];
+            let distance = (self.nodes[ixa].position - self.nodes[ixb].position).length();
+            energy += 0.5 * (spring.resting_length - distance).powi(2) * spring.spring_constant;
         }
         energy
     }
+
+    pub fn check_indices_equal_ids(&self) -> bool {
+        for (ix, node) in self.nodes.iter().enumerate() {
+            if ix != node.id {
+                return false;
+            }
+        }
+        for (ix, spring) in self.springs.iter().enumerate() {
+            if ix != spring.id {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub fn check_id_integrity(&self) -> bool {
+        for (ix, node) in self.nodes.iter().enumerate() {
+            if self.node_map[&node.id] != ix {
+                return false;
+            }
+        }
+        for (ix, spring) in self.springs.iter().enumerate() {
+            if self.spring_map[&spring.id] != ix {
+                return false;
+            }
+            if !self.node_map.contains_key(&spring.node_id_a) {
+                return false;
+            }
+            if !self.node_map.contains_key(&spring.node_id_b) {
+                return false;
+            }
+        }
+        for (&node_id, spring_ids) in &self.node_to_springs {
+            for spring_id in spring_ids.iter() {
+                let spring = self.springs[self.spring_map[spring_id]];
+                if (spring.node_id_a != node_id) && (spring.node_id_b != node_id) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    // Spring and Node accessors
 
     pub fn num_nodes(&self) -> usize {
         self.nodes.len()
@@ -903,11 +1117,31 @@ impl Contraption {
         self.nodes.iter_mut()
     }
 
-    pub fn get_node<'a>(&'a self, ix: usize) -> &'a Node {
+    pub fn get_node(&self, ix: usize) -> &Node {
         &self.nodes[ix]
     }
 
-    pub fn get_node_mut<'a>(&'a mut self, ix: usize) -> &'a mut Node {
+    pub fn get_node_mut(&mut self, ix: usize) -> &mut Node {
         &mut self.nodes[ix]
+    }
+
+    pub fn num_springs(&self) -> usize {
+        self.springs.len()
+    }
+
+    pub fn springs_iter<'a>(&'a self) -> std::slice::Iter<'a, Spring> {
+        self.springs.iter()
+    }
+
+    pub fn springs_iter_mut<'a>(&'a mut self) -> std::slice::IterMut<'a, Spring> {
+        self.springs.iter_mut()
+    }
+
+    pub fn get_spring(&self, ix: usize) -> &Spring {
+        &self.springs[ix]
+    }
+
+    pub fn get_spring_mut(&mut self, ix: usize) -> &mut Spring {
+        &mut self.springs[ix]
     }
 }

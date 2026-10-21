@@ -1,4 +1,4 @@
-use crate::{configs::NodeConfig, motor::Motor, spring::Spring, Float, P2, V2};
+use crate::{Float, P2, V2, configs::NodeConfig, motor::Motor, spring::Spring};
 use std::{fmt::Display, sync::RwLock, sync::Weak};
 
 pub type NodeId = usize;
@@ -56,7 +56,6 @@ pub struct Node {
     pub weight: Float,
     stationary: bool,
     motor: Option<Motor>,
-    pub attached: Vec<Attached>,
 }
 
 impl PartialEq for Node {
@@ -76,7 +75,6 @@ impl Node {
             weight: radius * radius,
             stationary: false,
             motor: None,
-            attached: Vec::new(),
         }
     }
 

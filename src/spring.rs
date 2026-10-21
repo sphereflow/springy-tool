@@ -1,5 +1,12 @@
-use crate::{Float, V2};
+use std::collections::HashMap;
+
+use crate::{
+    Float, P2, V2,
+    node::{Node, NodeId},
+};
 use egui::{Slider, Ui};
+
+pub type SpringId = usize;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SpringChange {
@@ -13,6 +20,7 @@ pub enum SpringChange {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Spring {
+    pub id: SpringId,
     pub spring_constant: Float,
     pub resting_length: Float,
     pub resting_length_factor: Float,
@@ -20,6 +28,8 @@ pub struct Spring {
     pub damping_factor: Float,
     pub min_len: Float,
     pub max_len: Float,
+    pub node_id_a: NodeId,
+    pub node_id_b: NodeId,
 }
 
 impl Spring {
@@ -41,6 +51,35 @@ impl Spring {
         self.min_len *= self.resting_length_factor;
         self.max_len *= self.resting_length_factor;
         self.resting_length_factor = 1.0;
+    }
+
+    pub fn is_destruct(&self, nodes: &[Node], node_map: &HashMap<NodeId, usize>) -> bool {
+        // search for the 2 nodes connecting this spring with the ids
+        let ixa = node_map[&self.node_id_a];
+        let ixb = node_map[&self.node_id_b];
+        let length = (nodes[ixa].position - nodes[ixb].position).length();
+        !((self.min_len * self.resting_length_factor)..=(self.max_len * self.resting_length_factor))
+            .contains(&length)
+    }
+
+    pub fn crosses(
+        &self,
+        nodes: &[Node],
+        node_map: &HashMap<NodeId, usize>,
+        ma: P2,
+        mb: P2,
+    ) -> bool {
+        let ixa = node_map[&self.node_id_a];
+        let ixb = node_map[&self.node_id_b];
+
+        let nap = nodes[ixa].position;
+        let nbp = nodes[ixb].position;
+        let va = ma - nap;
+        let vb = mb - nap;
+        let vc = nbp - ma;
+        let vs = nbp - nap;
+        let vm = mb - ma;
+        (vs.perp_dot(va) * vs.perp_dot(vb)) <= 0.0 && (vm.perp_dot(va) * vm.perp_dot(vc)) >= 0.0
     }
 
     pub fn ui(&mut self, ui: &mut Ui) -> Option<SpringChange> {
